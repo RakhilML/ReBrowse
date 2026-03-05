@@ -63,7 +63,7 @@ python -m rebrowse run "get trending repos from github"
 ## Quick start
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/RakhilML/ReBrowse
 cd rebrowse
 pip install -r requirements.txt
 playwright install chromium
@@ -222,23 +222,76 @@ rebrowse/
 
 ## Pre-built skills
 
-The [`skills/`](skills/) directory has documented API discoveries from 22+ major sites:
+The [`skills/`](skills/) directory has documented API discoveries from 23 major sites:
 
 | Site | Endpoints | Highlights |
 |------|-----------|------------|
-| Reddit | 12 | GraphQL, Popular Feed |
-| YouTube | 6 | Guide API, Feedback |
-| Twitter/X | 6 | GraphQL Viewer, Hashflags |
-| Amazon | 5 | Best Sellers, Recommendations |
-| Instagram | 12 | Search, Location Search, Friendships |
-| Spotify | 10 | GraphQL Pathfinder, Token API |
-| IMDB | 6 | GraphQL, Instant Search |
-| Twitch | 7 | GraphQL GQL |
-| Goodreads | 23 | Featured Books, Author Followings |
-| dev.to | 25 | Videos, Followers, Feed Events |
-| + 12 more | ... | ... |
+| [dev.to](skills/dev/skill.md) | 25 | Videos, Followers, Feed Events |
+| [Goodreads](skills/goodreads/skill.md) | 23 | Featured Books, Author Followings |
+| [Reddit](skills/reddit/skill.md) | 12 | GraphQL, Popular Feed |
+| [Instagram](skills/instagram/skill.md) | 12 | Search, Location Search, Friendships |
+| [Pinterest](skills/pinterest/skill.md) | 12 | User Data Resource, Pin Feed |
+| [Spotify](skills/spotify/skill.md) | 10 | GraphQL Pathfinder, Token API |
+| [eBay](skills/ebay/skill.md) | 8 | Autocomplete, Search |
+| [Twitch](skills/twitch/skill.md) | 7 | GraphQL GQL |
+| [Twitter/X](skills/twitter/skill.md) | 6 | GraphQL Viewer, Hashflags |
+| [YouTube](skills/youtube/skill.md) | 6 | Guide API, Feedback |
+| [IMDB](skills/imdb/skill.md) | 6 | GraphQL, Instant Search |
+| [LinkedIn](skills/linkedin/skill.md) | 6 | User Metadata, Litms API |
+| [Amazon](skills/amazon/skill.md) | 5 | Best Sellers, Recommendations |
+| [Netflix](skills/netflix/skill.md) | 5 | GraphQL, Shakti API |
+| [Medium](skills/medium/skill.md) | 4 | GraphQL, Content Feed |
+| [Flipkart](skills/flipkart/skill.md) | 3 | Homepage, Product API |
+| [Wikipedia](skills/wikipedia/skill.md) | 3 | MediaWiki API |
+| [Wikipedia Portal](skills/wikipedia-portal/skill.md) | 2 | Portal Homepage |
+| [Stack Overflow](skills/stackoverflow/skill.md) | 2 | Homepage, Questions |
+| [npm](skills/npmjs/skill.md) | 2 | Settings, Package Search |
+| [GitHub](skills/github/skill.md) | 1 | Trending Repos |
+| [Hacker News](skills/hackernews/skill.md) | 1 | Top Stories |
+| [JSONPlaceholder](skills/jsonplaceholder/skill.md) | 1 | REST API Resources |
 
-Each has a `skills/<site>/skill.md` with full endpoint docs.
+Each site links to its full endpoint documentation.
+
+## DSPy signatures
+
+All LLM interactions are defined as typed DSPy signatures — structured input/output contracts that make it clear what goes in and what comes out of each LLM call. This means the LLM isn't just getting a loose prompt; it's working against a defined schema.
+
+rebrowse uses three signatures:
+
+```python
+class ParseIntent(dspy.Signature):
+    """Extract structured intent from a natural language query."""
+    user_query: str = dspy.InputField()
+    domain: str = dspy.OutputField()     # e.g. "github.com"
+    action: str = dspy.OutputField()     # e.g. "get trending repositories"
+    params: dict = dspy.OutputField()    # e.g. {"language": "python"}
+
+class PickEndpoint(dspy.Signature):
+    """Pick the best API endpoint for a user's intent."""
+    intent: str = dspy.InputField()
+    endpoints: list[dict] = dspy.InputField()
+    endpoint_id: str = dspy.OutputField()
+    params: dict = dspy.OutputField()
+    query: dict = dspy.OutputField()
+    reason: str = dspy.OutputField()
+
+class DescribeEndpoints(dspy.Signature):
+    """Write descriptions for discovered API endpoints."""
+    endpoints_json: str = dspy.InputField()
+    descriptions_json: str = dspy.OutputField()
+```
+
+DSPy is **optional** — if it's not installed, rebrowse falls back to raw prompts that do the same thing. But when it's there, you get:
+- **Typed contracts** — the LLM knows exactly what fields to return, reducing malformed output
+- **Prompt optimization** — DSPy can auto-tune prompts for your specific model
+- **Swappable models** — change your LLM and the signatures still work; DSPy adapts the prompting style
+
+Install it separately if you want it:
+```bash
+pip install dspy
+```
+
+See [`rebrowse/llm/signatures.py`](rebrowse/llm/signatures.py) for the full source.
 
 ## Data storage
 
@@ -252,7 +305,3 @@ Everything lives at `~/.rebrowse/`:
 - Python 3.11+
 - Any LLM (local or cloud — see provider setup above)
 - Playwright (`playwright install chromium`)
-
-## License
-
-MIT
