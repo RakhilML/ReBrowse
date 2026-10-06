@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from rebrowse.models import RawRequest
-from rebrowse.reverse.extractor import _merge_schemas, _schema_from_values, extract_endpoints
+from rebrowse.reverse.extractor import _merge_schemas, extract_endpoints, schema_from_values
 
 
 def test_merge_objects_required_vs_optional():
-    schema = _schema_from_values([{"a": 1, "b": 2}, {"a": 9}])
+    schema = schema_from_values([{"a": 1, "b": 2}, {"a": 9}])
     assert schema.type == "object"
     assert schema.inferred_from_samples == 2
     assert set(schema.properties) == {"a", "b"}
@@ -14,7 +14,7 @@ def test_merge_objects_required_vs_optional():
 
 
 def test_merge_list_of_objects():
-    schema = _schema_from_values([[{"x": 1}, {"x": 2}]])
+    schema = schema_from_values([[{"x": 1}, {"x": 2}]])
     assert schema.type == "array"
     items = schema.items
     assert items["type"] == "object"

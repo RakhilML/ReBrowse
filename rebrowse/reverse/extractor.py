@@ -106,6 +106,7 @@ FRAMEWORK_QUERY_PARAMS = {"_rsc", "_next", "__next", "_t", "_hash", "__cf_chl_tk
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 NUMERIC_RE = re.compile(r"^\d{2,}$")
 HEX_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
+PLACEHOLDER_RE = re.compile(r"\{([^{}/]+)\}")
 
 
 def _is_sensitive_header(name: str) -> bool:
@@ -158,6 +159,11 @@ def _normalize_url(raw_url: str) -> tuple[str, dict[str, str]]:
     if parsed.path.endswith("/") and template_path != "/":
         template_path += "/"
     return f"{parsed.scheme}://{parsed.netloc}{template_path}", path_params
+
+
+def canonical_template(template: str) -> str:
+    """Erase placeholder names, so /u/{id} and /u/{users_id} compare equal."""
+    return PLACEHOLDER_RE.sub("{}", template)
 
 
 def _score_request(req: RawRequest) -> float:
@@ -371,7 +377,7 @@ def _scalar_type(val) -> str:
     return "unknown"
 
 
-def _schema_from_values(values: list, depth: int = 0) -> ResponseSchema:
+def schema_from_values(values: list, depth: int = 0) -> ResponseSchema:
     values = [v for v in values if v is not None]
     n = len(values)
     if depth > 4 or not values:
@@ -388,14 +394,14 @@ def _schema_from_values(values: list, depth: int = 0) -> ResponseSchema:
         props = {}
         required = []
         for k in keys:
-            props[k] = _schema_from_values([v[k] for v in values if k in v], depth + 1).model_dump()
+            props[k] = schema_from_values([v[k] for v in values if k in v], depth + 1).model_dump()
             if all(k in v for v in values):
                 required.append(k)
         return ResponseSchema(type="object", properties=props, required=required, inferred_from_samples=n)
 
     if all(isinstance(v, list) for v in values):
         items_vals = [item for v in values for item in v]
-        items = _schema_from_values(items_vals, depth + 1).model_dump() if items_vals else None
+        items = schema_from_values(items_vals, depth + 1).model_dump() if items_vals else None
         return ResponseSchema(type="array", items=items, inferred_from_samples=n)
 
     types = {_scalar_type(v) for v in values}
@@ -413,7 +419,7 @@ def _merge_schemas(bodies: list[str | None]) -> ResponseSchema | None:
             continue
     if not values:
         return None
-    return _schema_from_values(values)
+    return schema_from_values(values)
 
 
 def _lookslike_ad_response(body: str | None) -> bool:
