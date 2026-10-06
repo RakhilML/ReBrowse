@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from pathlib import Path
 
 import click
 
@@ -32,6 +33,7 @@ def main():
       build <url>       capture a site and save its APIs as a skill
       run <prompt>      pick a saved API for a request and call it
       verify <target>   health-check a skill's read endpoints
+      openapi <target>  export a skill as an OpenAPI 3.1 document
       mcp               serve skills to agents over MCP (stdio)
     """
     ensure_dirs()
@@ -80,6 +82,42 @@ def verify(target: str):
     from rebrowse.orchestrator.pipeline import verify as do_verify
 
     _emit(asyncio.run(do_verify(target)))
+
+
+@main.command()
+@click.argument("target")
+@click.option("--out", "-o", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Write the document to FILE instead of stdout.")
+def openapi(target: str, out: Path | None):
+    """Export a skill as an OpenAPI 3.1 document (JSON).
+
+    TARGET is a skill id or domain. Nothing is sent over the network, and sensitive
+    values in bodies, query strings and headers are redacted.
+    """
+    from rebrowse.openapi import skill_to_openapi
+    from rebrowse.store.skills import resolve_skill
+
+    skill = resolve_skill(target)
+    if skill is None:
+        _emit({"error": f"No skill matching '{target}'."})
+        return
+    document = skill_to_openapi(skill)
+    text = json.dumps(document, indent=2, ensure_ascii=False)
+    if out is None:
+        click.get_binary_stream("stdout").write((text + "\n").encode("utf-8"))
+        return
+    try:
+        out.write_text(text + "\n", encoding="utf-8", newline="\n")
+    except OSError as e:
+        _emit({"error": f"Could not write {out}: {e}"})
+        return
+    _emit({
+        "skill_id": skill.skill_id,
+        "domain": skill.domain,
+        "path": str(out.resolve()),
+        "paths": len(document["paths"]),
+        "operations": sum(len(methods) for methods in document["paths"].values()),
+    })
 
 
 @main.command()

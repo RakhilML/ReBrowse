@@ -42,6 +42,7 @@ rebrowse run "add a note saying hi" --dry-run      # show the resolved call, sen
 rebrowse run "add a note saying hi" --yes          # confirm a call that changes state
 
 rebrowse verify news.ycombinator.com               # health-check a skill's read endpoints
+rebrowse openapi news.ycombinator.com -o api.json  # OpenAPI 3.1 export (stdout without -o)
 rebrowse skills [-q "search"]  |  rebrowse show <id>  |  rebrowse delete <id>
 rebrowse auth set api.github.com ghp_xxx [--type bearer|header|query]
 rebrowse mcp                                       # MCP server over stdio
@@ -71,6 +72,22 @@ parameter names, and the endpoint list is marked as untrusted data.
 
 **verify** — re-executes read endpoints only and records `verified`/`failed` and a
 reliability score; `run` skips failed endpoints and ranks the rest.
+
+## OpenAPI export
+
+`rebrowse openapi <target>` turns a skill into an OpenAPI 3.1 JSON document that Swagger UI
+or Redoc can render, Prism can mock (`prism mock api.json`) and Schemathesis can
+contract-test. Each operation carries `x-rebrowse-effect` (`read`/`write`/`destructive`),
+`x-rebrowse-verification` and `x-rebrowse-observed` (`false` for routes found only in a JS
+bundle), so a test run can be limited to reads. Response schemas mark fields seen in every
+sample as required; GraphQL operations sharing one URL are merged into one documented
+operation. The export runs offline, never includes cookies or auth headers, and redacts
+values whose names look secret (`password`, `passwd`, `token`, `csrf`, `session`, `api_key`,
+...), also inside JSON-encoded query values such as GraphQL `variables`. Request bodies get a
+schema and example only when they are JSON or form-encoded; multipart and XML bodies are
+listed by media type alone, and GET operations never document a body. The output is
+deterministic, so committing it and re-exporting after a rebuild makes `git diff` a drift
+report.
 
 ## Safety model
 
@@ -102,7 +119,7 @@ Tools: `search_skills`, `list_operations` (read-only), `read` (executes reads on
 ## Development
 
 ```bash
-pytest            # 124 tests; local fixture site, real headless Chromium, no internet
+pytest            # local fixture site, real headless Chromium, no internet
 ruff check rebrowse tests
 ```
 

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from rebrowse import config
 from rebrowse.auth.vault import get_cookies
 from rebrowse.capture import browser
 from rebrowse.llm.client import LLMError
+from rebrowse.models import CaptureResult
+from rebrowse.openapi import skill_to_openapi
 from rebrowse.orchestrator import pipeline
-from rebrowse.store.skills import list_all_skills
+from rebrowse.reverse.extractor import canonical_template
+from rebrowse.store.skills import list_all_skills, resolve_skill
 
 
 @pytest.fixture
@@ -71,6 +76,18 @@ async def test_build_extracts_traffic_and_bundle_routes(built, isolated):
 
     assert list((isolated / "captures").glob("*.json"))
     assert any(c["name"] == "sid" for c in get_cookies(built["domain"]))
+
+
+def test_bundle_routes_matching_a_known_template_are_skipped():
+    capture = CaptureResult(domain="app.local", final_url="http://app.local/", js_bundles={
+        "http://app.local/app.js": "fetch(`/api/users/${id}/posts`); fetch(`/api/teams/${team}`);"
+                                   " fetch(`/api/teams/${teamId}`);",
+    })
+    known = {("GET", canonical_template("http://app.local/api/users/{users_id}/posts"))}
+
+    routes = pipeline._bundle_endpoints(capture, known)
+
+    assert [ep.url_template for ep in routes] == ["http://app.local/api/teams/{team}"]
 
 
 async def test_rebuild_replaces_instead_of_duplicating(built, fixture_site):
@@ -146,3 +163,17 @@ async def test_run_with_empty_store(llm):
     llm["intent"] = {"domain": "nowhere.example", "action": "anything"}
     out = await pipeline.run("anything")
     assert out["error"].startswith("No skills stored")
+
+
+async def test_built_skill_exports_without_browser_headers_or_cookies(built):
+    spec = skill_to_openapi(resolve_skill(built["skill_id"]))
+    ops = {(path, method): op for path, methods in spec["paths"].items()
+           for method, op in methods.items()}
+
+    assert "abc123" not in json.dumps(spec)
+    assert not [p for op in ops.values() for p in op.get("parameters", []) if p["in"] == "header"]
+    notes = ops[("/api/notes", "post")]["requestBody"]["content"]["application/json"]
+    assert notes["example"] == {"text": "hi"}
+    assert ops[("/api/comments/delete", "post")]["x-rebrowse-effect"] == "destructive"
+    assert ops[("/api/users/{id}/posts", "get")]["x-rebrowse-observed"] is False
+    assert ops[("/api/items", "get")]["x-rebrowse-observed"] is True
