@@ -45,6 +45,7 @@ rebrowse run "add a note saying hi" --yes          # confirm a call that changes
 rebrowse verify news.ycombinator.com               # health-check a skill's read endpoints
 rebrowse openapi news.ycombinator.com -o api.json  # OpenAPI 3.1 export (stdout without -o)
 rebrowse mock e2e.har [-p 8787]                    # serve the recorded API on 127.0.0.1
+rebrowse diff baseline.har e2e.har                 # API changes that break the client
 rebrowse skills [-q "search"]  |  rebrowse show <id>  |  rebrowse delete <id>
 rebrowse auth set api.github.com ghp_xxx [--type bearer|header|query]
 rebrowse mcp                                       # MCP server over stdio
@@ -87,9 +88,10 @@ operation. The export runs offline, never includes cookies or auth headers, and 
 values whose names look secret (`password`, `passwd`, `token`, `csrf`, `session`, `api_key`,
 ...), also inside JSON-encoded query values such as GraphQL `variables`. Request bodies get a
 schema and example only when they are JSON or form-encoded; multipart and XML bodies are
-listed by media type alone, and GET operations never document a body. The output is
-deterministic, so committing it and re-exporting after a rebuild makes `git diff` a drift
-report.
+listed by media type alone, and GET operations never document a body. Two exports of an
+unchanged API are not identical (descriptions come from the LLM and `info.version` is the
+save time), so to see what changed, compare the recordings:
+`rebrowse diff baseline.har e2e.har` (see [Drift report](#drift-report)).
 
 ## Import from HAR
 
@@ -119,12 +121,12 @@ rebrowse never imports cookies from a HAR, and `auth set` only holds a bearer to
 `X-API-Key` or an `api_key` query value, so an app that signs in with a session cookie can be
 documented but not replayed. `verify` reports such reads as failed: a 401, or `auth_required`
 when the request is redirected to an HTML sign-in page. Importing the same site again, or
-after a `build`, replaces its skill and keeps its id. In CI, regenerate the API document from
-the e2e run and let `git diff` report drift (descriptions come from the LLM and
-`info.version` is the import time, so expect those lines to move too):
+after a `build`, replaces its skill and keeps its id. In CI, compare the e2e run's HAR with
+the one recorded on the main branch, which fails the job on a change that breaks the client
+(see [Drift report](#drift-report)):
 
 ```bash
-rebrowse import-har e2e.har && rebrowse openapi app.local -o api.json
+rebrowse diff baseline.har e2e.har
 ```
 
 ## Mock server
@@ -171,6 +173,64 @@ answered.
   (DNS rebinding), answers CORS, with credentials, only for `localhost`, `127.0.0.1` and
   `[::1]` origins, and refuses cross-site requests from pages that are not on localhost, so
   another website cannot read it through a `<script>` tag.
+
+## Drift report
+
+`rebrowse diff BASE HEAD` compares the API traffic in two recordings of the same app and
+reports what changed from the client's point of view, without a spec, an LLM or the network.
+BASE and HEAD are read as `mock` reads SOURCE: a HAR file, a capture saved by `build`, or a
+`host[:port]` whose newest saved capture is used. By default each side uses the host of its
+own first HTML page, so `prod.har` and `staging.har` line up; `--domain` picks the site in
+both files, or in BASE then HEAD when given twice. A side with no API traffic, such as a run
+that never got past sign-in, is an input error rather than a pass.
+
+```bash
+# main: run the e2e suite with browser.new_context(record_har_path="baseline.har"), keep it
+# PR:   run it again with record_har_path="e2e.har", then
+rebrowse diff baseline.har e2e.har       # exit 0: nothing breaks, 1: breaking, 2: bad input
+rebrowse diff prod.har staging.har       # or two DevTools exports, or two build captures
+```
+
+- **Routes.** The ones `mock` serves: same-site API calls with ids templated
+  (`/api/users/1001` and `/api/users/42` are one route), one route per GraphQL operation, and
+  sibling hosts kept apart. Unlike `mock`, redirects are kept, and a 304 counts as an
+  answer.
+- **Breaking.** A route that answered 2xx and no longer does, such as one that now redirects
+  to a sign-in page, or that starts returning a 5xx it never did (`status`); a 2xx response
+  with a media type BASE never returned, such as JSON turning into an HTML page
+  (`content_type`); JSON turning into an empty body or a 204 (`body_empty`); a field present
+  in every BASE response that is gone (`field_removed`) or missing from some HEAD responses
+  (`field_optional`); a field with a new JSON type, including a new `null` (`field_type`).
+  `integer` where BASE had `number` is fine, and `number` where BASE had `integer` is info,
+  since a JavaScript client cannot tell them apart (`1.0` counts as an integer).
+- **Info.** Other status changes, added fields, removed fields that BASE did not always send
+  (that may be sampling), and routes recorded on one side only (`route_added`,
+  `route_missing`). The client drives the calls, so an endpoint the backend removed while the
+  client still calls it shows up as a status change.
+- **Fields.** Read from 2xx JSON bodies (also behind an XSSI guard), down to 12 levels; a route
+  recorded without bodies, as DevTools does after a navigation, gets no field changes. A field
+  that is no longer an object is reported once, not field by field. Paths read
+  `$.items[].sku` and `$["content-type"]`. A key that looks like a value rather than a name
+  is a map key: one that does not start with a letter (an id or a date), holds a character
+  other than letters, digits, `_`, `.`, `:` and `-` (a name or an email), is a UUID or 16 or
+  more hex digits, or is 16 or more name characters with digits in three or more places (a
+  generated id or token, such as `ghp_...`, a nanoid or a JWT). The values of all such keys
+  are compared together under `.*`, as in `$.members.*.role`, and the key is not reported.
+  Map keys that read like names (`alice`, `SKU123ABC`, a slug) cannot be told from fields
+  and are reported as fields. Names with digits, such as `address_line_2` or
+  `oauth2RedirectUri`, stay fields, and fields with secret names such as `accessToken` are
+  compared by type like any other.
+
+The report is JSON on stdout: each side's source, domain, route count and how many of
+those routes had JSON bodies to compare (a HAR recorded without content compares statuses
+and media types only), the number of breaking changes, and the changes ordered by route,
+then status, media type, body and fields depth-first. It holds route names, statuses, media
+types, field paths and JSON type names, never a response value:
+
+```json
+{"severity": "breaking", "kind": "field_type", "route": "GET /api/orders/{orders_id}",
+ "field": "$.total", "base": ["string"], "head": ["null", "string"]}
+```
 
 ## Safety model
 

@@ -8,11 +8,15 @@ import json
 import socket
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import click
 
 from rebrowse.config import ensure_dirs
+
+if TYPE_CHECKING:
+    from rebrowse.models import CaptureResult
 
 if sys.platform == "win32":
     for stream in (sys.stdout, sys.stderr):
@@ -22,10 +26,10 @@ if sys.platform == "win32":
             pass
 
 
-def _emit(result: dict) -> None:
+def _emit(result: dict, error_code: int = 1) -> None:
     print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
     if result.get("error") and not result.get("success"):
-        sys.exit(1)
+        sys.exit(error_code)
 
 
 @click.group()
@@ -39,6 +43,7 @@ def main():
       verify <target>   health-check a skill's read endpoints
       openapi <target>  export a skill as an OpenAPI 3.1 document
       mock <source>     serve recorded API responses on localhost
+      diff <a> <b>      report API changes between two recordings
       mcp               serve skills to agents over MCP (stdio)
     """
     ensure_dirs()
@@ -150,6 +155,20 @@ def _netloc(text: str) -> str:
     return urlsplit(text).netloc if "://" in text else text
 
 
+def _traffic(source: str, domain: str | None) -> tuple[Path, CaptureResult]:
+    """Load SOURCE as a file, else the newest saved capture of that host; raises ValueError."""
+    from rebrowse.capture.store import latest_capture, load_traffic, saved_domains
+
+    path: Path | None = Path(source)
+    if not path.is_file():
+        path = latest_capture(_netloc(source))
+    if path is None:
+        saved = ", ".join(saved_domains()) or "none"
+        raise ValueError(f"'{source}' is neither a file nor a domain with a saved capture "
+                         f"(saved: {saved}). For an imported HAR, pass the HAR file.")
+    return path, load_traffic(path, _netloc(domain) if domain else None)
+
+
 @main.command(short_help="Serve recorded API responses on 127.0.0.1.")
 @click.argument("source")
 @click.option("--domain", "-d", default=None, metavar="HOST[:PORT]",
@@ -164,19 +183,10 @@ def mock(source: str, domain: str | None, port: int):
     Nothing is forwarded to the real site, secret-named values in responses are redacted,
     and no recorded header but content-type is sent back.
     """
-    from rebrowse.capture.store import latest_capture, load_traffic, saved_domains
     from rebrowse.mock import MockServer, build_routes, route_table
 
-    path: Path | None = Path(source)
-    if not path.is_file():
-        path = latest_capture(_netloc(source))
-    if path is None:
-        saved = ", ".join(saved_domains()) or "none"
-        _emit({"error": f"'{source}' is neither a file nor a domain with a saved capture "
-                        f"(saved: {saved}). For an imported HAR, pass the HAR file."})
-        return
     try:
-        capture = load_traffic(path, _netloc(domain) if domain else None)
+        path, capture = _traffic(source, domain)
     except ValueError as e:
         _emit({"error": str(e)})
         return
@@ -196,6 +206,55 @@ def mock(source: str, domain: str | None, port: int):
     sys.stdout.flush()
     with server, contextlib.suppress(KeyboardInterrupt):
         server.serve_forever()
+
+
+def _side(path: Path, capture: CaptureResult, facts: dict) -> dict:
+    bodies = sum(1 for fact in facts.values() if fact.shape.seen)
+    return {"source": str(path.resolve()), "domain": capture.domain, "routes": len(facts),
+            "bodies": bodies}
+
+
+@main.command(short_help="Report API changes between two recordings.")
+@click.argument("base")
+@click.argument("head")
+@click.option("--domain", "-d", "domains", multiple=True, metavar="HOST[:PORT]",
+              help="Site to compare in HAR files; give it twice for BASE then HEAD "
+                   "(default: host of each one's first HTML page).")
+def diff(base: str, head: str, domains: tuple[str, ...]):
+    """Report the API changes from BASE to HEAD that can break their client.
+
+    Each is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
+    capture is used. Nothing is sent over the network, and the report holds routes,
+    statuses, media types, field paths and JSON types, never a response value (object keys
+    that read like names do appear, as field names). Exits 1 when a change is breaking and
+    2 when an input cannot be read or holds no API traffic.
+    """
+    from rebrowse.drift import BREAKING, compare_facts, route_facts
+
+    if len(domains) > 2:
+        raise click.BadParameter("give it at most twice", param_hint="--domain")
+    base_domain, head_domain = (domains * 2)[:2] if domains else (None, None)
+    try:
+        base_path, base_capture = _traffic(base, base_domain)
+        head_path, head_capture = _traffic(head, head_domain)
+    except ValueError as e:
+        _emit({"error": str(e)}, error_code=2)
+        return
+    before, after = route_facts(base_capture), route_facts(head_capture)
+    for path, capture, facts in ((base_path, base_capture, before),
+                                 (head_path, head_capture, after)):
+        if not facts:
+            _emit({"error": f"No API traffic for {capture.domain} in {path}"}, error_code=2)
+            return
+    changes = compare_facts(before, after)
+    breaking = sum(change["severity"] == BREAKING for change in changes)
+    _emit({
+        "base": _side(base_path, base_capture, before),
+        "head": _side(head_path, head_capture, after),
+        "breaking": breaking,
+        "changes": changes,
+    })
+    sys.exit(1 if breaking else 0)
 
 
 @main.command()

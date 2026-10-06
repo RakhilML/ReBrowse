@@ -132,7 +132,7 @@ def _sanitize_query(params: dict[str, list[str]]) -> dict[str, str]:
     return out
 
 
-def _looks_like_id(segment: str) -> bool:
+def looks_like_id(segment: str) -> bool:
     return bool(
         UUID_RE.match(segment) or NUMERIC_RE.match(segment) or HEX_RE.match(segment)
         or ("," in segment and len(segment.split(",")) >= 3)
@@ -144,7 +144,7 @@ def normalize_url(raw_url: str) -> tuple[str, dict[str, str]]:
     path_params: dict[str, str] = {}
     new_segments: list[str] = []
     for seg in parsed.path.strip("/").split("/"):
-        if not _looks_like_id(seg):
+        if not looks_like_id(seg):
             new_segments.append(seg)
             continue
         prev = new_segments[-1] if new_segments else ""
