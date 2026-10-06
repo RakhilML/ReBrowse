@@ -1,18 +1,20 @@
-"""build, run and verify pipelines."""
+"""build, import-har, run and verify pipelines."""
 
 from __future__ import annotations
 
 import json
 import sys
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 
 from rebrowse.auth.vault import store_cookies
 from rebrowse.capture.browser import capture_session
+from rebrowse.capture.har import HarError, load_har
 from rebrowse.capture.store import save_capture
 from rebrowse.execution.executor import execute_endpoint
 from rebrowse.llm.client import LLMError, describe_endpoints, parse_intent, pick_endpoint
-from rebrowse.models import EndpointDescriptor, SkillManifest, VerificationStatus
+from rebrowse.models import CaptureResult, EndpointDescriptor, SkillManifest, VerificationStatus
 from rebrowse.reverse.extractor import canonical_template, extract_endpoints, is_telemetry_path
 from rebrowse.reverse.scanner import is_third_party_bundle, scan_bundles_for_routes
 from rebrowse.safety import Effect, classify_effect
@@ -64,7 +66,7 @@ def _bundle_endpoints(capture, known: set[tuple[str, str]]) -> list[EndpointDesc
     return out
 
 
-async def _describe(endpoints: list[EndpointDescriptor]) -> None:
+async def _describe(endpoints: list[EndpointDescriptor], tag: str) -> None:
     pending = [ep for ep in endpoints if not ep.description][:MAX_DESCRIBE]
     if not pending:
         return
@@ -73,7 +75,7 @@ async def _describe(endpoints: list[EndpointDescriptor]) -> None:
             [{"url_template": ep.url_template, "method": ep.method.value} for ep in pending]
         )
     except LLMError as e:
-        _log(f"[build] LLM description failed: {e}")
+        _log(f"[{tag}] LLM description failed: {e}")
         return
     by_key = {
         (d.get("method", "").upper(), d.get("url_template", "")): d.get("description", "")
@@ -85,31 +87,18 @@ async def _describe(endpoints: list[EndpointDescriptor]) -> None:
             ep.description = text
 
 
-async def build(url: str, steps: str | None = None) -> dict:
-    t0 = time.time()
-    _log(f"[build] Capturing {url} ...")
-    capture = await capture_session(url, steps=steps)
-    _log(f"[build] Captured {len(capture.requests)} requests from {capture.domain}")
-    if not capture.requests:
-        return {"error": f"No traffic captured from {url}", "timing_ms": _elapsed(t0)}
-
-    try:
-        _log(f"[build] Saved capture to {save_capture(capture)}")
-    except OSError as e:
-        _log(f"[build] Could not save capture: {e}")
-
+async def _learn(capture: CaptureResult, intent_signature: str, tag: str) -> dict:
     endpoints = extract_endpoints(capture.requests, page_domain=capture.domain)
     known = {(ep.method.value, canonical_template(ep.url_template)) for ep in endpoints}
     endpoints += _bundle_endpoints(capture, known)
-    _log(f"[build] {len(endpoints)} endpoints")
+    _log(f"[{tag}] {len(endpoints)} endpoints")
     if not endpoints:
         return {
             "error": f"No API endpoints found on {capture.domain}",
             "requests_captured": len(capture.requests),
-            "timing_ms": _elapsed(t0),
         }
 
-    await _describe(endpoints)
+    await _describe(endpoints, tag)
     for ep in endpoints:
         if not ep.description and ep.trigger_url is None:
             ep.description = f"JS bundle route: {urlparse(ep.url_template).path}"
@@ -118,7 +107,7 @@ async def build(url: str, steps: str | None = None) -> dict:
         name=f"{capture.domain} API",
         domain=capture.domain,
         description=f"Auto-discovered APIs from {capture.domain}",
-        intent_signature=url,
+        intent_signature=intent_signature,
         endpoints=endpoints,
     )
     existing = find_exact_domain(capture.domain)
@@ -128,7 +117,7 @@ async def build(url: str, steps: str | None = None) -> dict:
     save_skill(skill)
     if capture.cookies:
         store_cookies(capture.domain, capture.cookies)
-    _log(f"[build] Saved skill {skill.skill_id} ({'replaced' if existing else 'new'})")
+    _log(f"[{tag}] Saved skill {skill.skill_id} ({'replaced' if existing else 'new'})")
 
     return {
         "skill_id": skill.skill_id,
@@ -146,6 +135,37 @@ async def build(url: str, steps: str | None = None) -> dict:
             }
             for ep in endpoints
         ],
+    }
+
+
+async def build(url: str, steps: str | None = None) -> dict:
+    t0 = time.time()
+    _log(f"[build] Capturing {url} ...")
+    capture = await capture_session(url, steps=steps)
+    _log(f"[build] Captured {len(capture.requests)} requests from {capture.domain}")
+    if not capture.requests:
+        return {"error": f"No traffic captured from {url}", "timing_ms": _elapsed(t0)}
+
+    try:
+        _log(f"[build] Saved capture to {save_capture(capture)}")
+    except OSError as e:
+        _log(f"[build] Could not save capture: {e}")
+
+    return {**await _learn(capture, url, "build"), "timing_ms": _elapsed(t0)}
+
+
+async def import_har(path: Path, domain: str | None = None) -> dict:
+    t0 = time.time()
+    try:
+        capture = load_har(path, domain)
+    except HarError as e:
+        return {"error": str(e), "timing_ms": _elapsed(t0)}
+    _log(f"[import-har] Read {len(capture.requests)} requests for {capture.domain} from {path}")
+    if not capture.requests:
+        return {"error": f"No requests to import from {path}", "timing_ms": _elapsed(t0)}
+    return {
+        **await _learn(capture, capture.final_url, "import-har"),
+        "source": str(path.resolve()),
         "timing_ms": _elapsed(t0),
     }
 

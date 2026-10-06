@@ -31,6 +31,7 @@ def main():
 
     \b
       build <url>       capture a site and save its APIs as a skill
+      import-har <har>  build a skill from a HAR export (DevTools, proxy, e2e run)
       run <prompt>      pick a saved API for a request and call it
       verify <target>   health-check a skill's read endpoints
       openapi <target>  export a skill as an OpenAPI 3.1 document
@@ -55,6 +56,21 @@ def build(url: str, steps: str | None):
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
     _emit(asyncio.run(do_build(url, steps=steps)))
+
+
+@main.command("import-har", short_help="Build a skill from a HAR export, without a browser.")
+@click.argument("file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--domain", "-d", default=None, metavar="HOST[:PORT]",
+              help="Site in the HAR to learn (default: host of the first HTML page).")
+def import_har(file: Path, domain: str | None):
+    """Build a skill from a HAR file exported by browser DevTools, a proxy or a test run.
+
+    No request is replayed. Cookies, Authorization and other credential headers are dropped,
+    and secret-named query and body values are redacted before anything is stored.
+    """
+    from rebrowse.orchestrator.pipeline import import_har as do_import
+
+    _emit(asyncio.run(do_import(file, domain)))
 
 
 @main.command()

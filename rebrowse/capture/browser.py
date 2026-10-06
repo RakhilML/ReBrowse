@@ -16,7 +16,6 @@ STATIC_EXTENSIONS = (
     ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
     ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".avif",
 )
-MAX_BUNDLE_CHARS = 2_000_000
 
 _browser_sem = asyncio.Semaphore(config.MAX_CONCURRENT_BROWSERS)
 
@@ -79,7 +78,7 @@ async def capture_session(
                         body = await response.text()
                     except (PlaywrightError, ValueError):
                         return
-                    if len(body) < MAX_BUNDLE_CHARS:
+                    if len(body) < config.MAX_BUNDLE_CHARS:
                         js_bundles[req.url] = body
                 return
             try:

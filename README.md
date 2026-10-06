@@ -36,6 +36,7 @@ non-local host, and warns once when prompts would leave the machine unencrypted.
 ```bash
 rebrowse build https://news.ycombinator.com
 rebrowse build https://example.com --steps "type #q=shoes; click #search; wait 800"
+rebrowse import-har session.har [-d app.local:8080]  # learn from a HAR export instead
 
 rebrowse run "top stories on hacker news"
 rebrowse run "add a note saying hi" --dry-run      # show the resolved call, send nothing
@@ -89,6 +90,42 @@ listed by media type alone, and GET operations never document a body. The output
 deterministic, so committing it and re-exporting after a rebuild makes `git diff` a drift
 report.
 
+## Import from HAR
+
+`build` only sees what a fresh, logged-out browser sees in a few scrolls. If you already
+have the traffic, import it instead: `rebrowse import-har session.har` reads a HAR 1.2 file
+and builds the same kind of skill, without launching a browser or replaying any request.
+
+- **Browser DevTools.** Sign in yourself, use the app, then in the Network panel choose
+  "Save all as HAR" (Chrome) or "Save All As HAR" (Firefox).
+- **An e2e suite.** Playwright records one with
+  `browser.new_context(record_har_path="e2e.har")`, so every flow the tests exercise ends up
+  in the skill.
+- **A proxy.** mitmproxy, Charles and Proxyman all export HAR.
+
+The skill is learned for one site: `--domain host[:port]`, defaulting to the host of the
+first HTML page in the file. Credentials are stripped as the file is read, before anything
+is stored or sent to the LLM: `Cookie`, `Set-Cookie`, `Authorization`, API-key, CSRF and
+session headers are dropped, the HAR's cookie lists are ignored, and query, JSON and form
+values with secret-looking names (passwords, tokens, keys, SAML assertions...) are replaced
+by `<redacted>`. A body that parses as JSON is treated as JSON whatever its declared type;
+other bodies that are not form-encoded (multipart, XML, binary) are dropped, because they
+cannot be redacted.
+Response bodies are only used to infer schemas. The HAR itself is the source, so nothing is
+copied to `captures/`; import it again to re-extract.
+
+rebrowse never imports cookies from a HAR, and `auth set` only holds a bearer token, an
+`X-API-Key` or an `api_key` query value, so an app that signs in with a session cookie can be
+documented but not replayed. `verify` reports such reads as failed: a 401, or `auth_required`
+when the request is redirected to an HTML sign-in page. Importing the same site again, or
+after a `build`, replaces its skill and keeps its id. In CI, regenerate the API document from
+the e2e run and let `git diff` report drift (descriptions come from the LLM and
+`info.version` is the import time, so expect those lines to move too):
+
+```bash
+rebrowse import-har e2e.har && rebrowse openapi app.local -o api.json
+```
+
 ## Safety model
 
 - **Effects.** Every endpoint is labelled `read`, `write` or `destructive` from its
@@ -103,7 +140,8 @@ report.
   403s, CAPTCHAs) are reported as `blocked`, never returned as data; there is no
   bypass logic.
 - **Credentials stay scoped.** Stored cookies and API keys are attached only to their
-  own site; nothing reads your browser's cookie store. Requests are paced per host
+  own site and are dropped from any redirect that leaves it; nothing reads your browser's
+  cookie store. Requests are paced per host
   (`REBROWSE_HOST_INTERVAL`, default 1s).
 
 ## MCP
