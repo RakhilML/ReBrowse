@@ -2,7 +2,10 @@
 
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
+
+from rebrowse import __version__
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
@@ -12,24 +15,26 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL_INTENT = os.getenv("LLM_MODEL_INTENT", "qwen/qwen3-8b")
 LLM_MODEL_CODE = os.getenv("LLM_MODEL_CODE", "qwen/qwen3-coder-next")
 
-DATA_DIR = Path.home() / ".rebrowse"
-SKILLS_DIR = DATA_DIR / "skills"
+DATA_DIR = Path(os.getenv("REBROWSE_DATA_DIR") or Path.home() / ".rebrowse")
+CAPTURES_DIR = DATA_DIR / "captures"
 DB_PATH = DATA_DIR / "skills.db"
 VAULT_DIR = DATA_DIR / "vault"
 
-CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36"
+REBROWSE_UA = os.getenv(
+    "REBROWSE_UA",
+    f"rebrowse/{__version__} (+https://github.com/RakhilML/ReBrowse)",
 )
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 MAX_CONCURRENT_BROWSERS = 3
 CAPTURE_TIMEOUT_MS = 90_000
+CAPTURE_SETTLE_S = 2.5
 MAX_BODY_SIZE = 512 * 1024
 MAX_JS_BUNDLES = 20
+MAX_RESULT_CHARS = 20_000
+HOST_MIN_INTERVAL_S = float(os.getenv("REBROWSE_HOST_INTERVAL", "1.0"))
 
 
 def ensure_dirs():
-    for d in [DATA_DIR, SKILLS_DIR, VAULT_DIR]:
+    for d in [DATA_DIR, CAPTURES_DIR, VAULT_DIR]:
         d.mkdir(parents=True, exist_ok=True)
