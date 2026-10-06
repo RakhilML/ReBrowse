@@ -7,6 +7,7 @@ from rebrowse.store.skills import (
     find_by_domain,
     find_exact_domain,
     list_all_skills,
+    resolve_skill,
     save_skill,
     search_skills,
 )
@@ -54,3 +55,13 @@ def test_delete():
     assert delete_skill(skill.skill_id) is True
     assert delete_skill(skill.skill_id) is False
     assert list_all_skills() == []
+
+
+def test_resolve_skill_prefers_id_over_domain_match():
+    by_domain = SkillManifest(name="a", domain="abc.example")
+    by_id = SkillManifest(skill_id="abc", name="b", domain="other.example")
+    save_skill(by_domain)
+    save_skill(by_id)
+    assert resolve_skill("abc").skill_id == "abc"
+    assert resolve_skill("abc.example").skill_id == by_domain.skill_id
+    assert resolve_skill("nowhere") is None

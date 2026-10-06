@@ -13,14 +13,14 @@ from rebrowse.capture.store import save_capture
 from rebrowse.execution.executor import execute_endpoint
 from rebrowse.llm.client import LLMError, describe_endpoints, parse_intent, pick_endpoint
 from rebrowse.models import EndpointDescriptor, SkillManifest, VerificationStatus
-from rebrowse.reverse.extractor import extract_endpoints, is_telemetry_path
+from rebrowse.reverse.extractor import canonical_template, extract_endpoints, is_telemetry_path
 from rebrowse.reverse.scanner import is_third_party_bundle, scan_bundles_for_routes
 from rebrowse.safety import Effect, classify_effect
 from rebrowse.selection import usable_endpoints
 from rebrowse.store.skills import (
     find_by_domain,
     find_exact_domain,
-    list_all_skills,
+    resolve_skill,
     save_skill,
     search_skills,
 )
@@ -51,7 +51,7 @@ def _bundle_endpoints(capture, known: set[tuple[str, str]]) -> list[EndpointDesc
     }
     out = []
     for route in scan_bundles_for_routes(bundles, f"{parsed.scheme}://{parsed.netloc}"):
-        key = (route.method, route.url)
+        key = (route.method, canonical_template(route.url))
         if key in known or is_telemetry_path(route.path):
             continue
         known.add(key)
@@ -99,7 +99,7 @@ async def build(url: str, steps: str | None = None) -> dict:
         _log(f"[build] Could not save capture: {e}")
 
     endpoints = extract_endpoints(capture.requests, page_domain=capture.domain)
-    known = {(ep.method.value, ep.url_template) for ep in endpoints}
+    known = {(ep.method.value, canonical_template(ep.url_template)) for ep in endpoints}
     endpoints += _bundle_endpoints(capture, known)
     _log(f"[build] {len(endpoints)} endpoints")
     if not endpoints:
@@ -258,13 +258,9 @@ async def run(prompt: str, dry_run: bool = False, assume_yes: bool = False) -> d
     }
 
 
-def _resolve_skill(target: str) -> SkillManifest | None:
-    return next((s for s in list_all_skills() if s.skill_id == target), None) or find_by_domain(target)
-
-
 async def verify(target: str) -> dict:
     t0 = time.time()
-    skill = _resolve_skill(target)
+    skill = resolve_skill(target)
     if not skill:
         return {"error": f"No skill matching '{target}'.", "timing_ms": _elapsed(t0)}
 

@@ -158,6 +158,12 @@ def find_by_domain(domain: str) -> SkillManifest | None:
         return _latest(db, "domain LIKE ? ESCAPE '\\'", f"%{escaped}%")
 
 
+def resolve_skill(target: str) -> SkillManifest | None:
+    with _db() as db:
+        skill = _latest(db, "skill_id = ?", target)
+    return skill or find_by_domain(target)
+
+
 def search_skills(query: str, limit: int = 5) -> list[tuple[SkillManifest, float]]:
     with _db() as db:
         rows = db.execute(
