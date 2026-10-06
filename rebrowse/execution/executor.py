@@ -1,54 +1,124 @@
-"""Execute API skills — direct HTTP calls with retry logic."""
+"""Execute stored endpoints over HTTP."""
 
 from __future__ import annotations
-import json
+
 import asyncio
+import time
+from urllib.parse import urlparse
+
 import httpx
-from rebrowse import config
-from rebrowse.models import (
-    EndpointDescriptor, SkillManifest, ExecutionTrace, HttpMethod, _id, _now,
-)
-from rebrowse.auth.vault import get_cookies, get_api_key
-from rebrowse.auth.cookies import extract_browser_cookies
 
+from rebrowse import config, net
+from rebrowse.auth.vault import get_api_key, get_cookies
+from rebrowse.models import EndpointDescriptor, ExecutionTrace, HttpMethod, SkillManifest, _now
+from rebrowse.reverse.extractor import is_replay_header, same_site
+from rebrowse.safety import Effect
 
-RETRYABLE_STATUSES = {500, 502, 503, 504, 429}
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 2
 BASE_DELAY = 1.0
 MAX_DELAY = 10.0
+TIMEOUT_S = 30.0
 
-_http = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+CHALLENGE_MARKERS = (
+    "just a moment...", "cf-chl", "challenge-platform", "captcha",
+    "blocked by network security", "please respect our robot policy",
+    "unusual traffic", "are you a robot", "access denied",
+)
+
+_last_request_at: dict[str, float] = {}
 
 
 def _build_url(endpoint: EndpointDescriptor, params: dict | None = None) -> str:
-    """Substitute path params into URL template."""
     url = endpoint.url_template
-    merged = {**(endpoint.path_params or {}), **(params or {})}
-    for key, val in merged.items():
+    for key, val in {**(endpoint.path_params or {}), **(params or {})}.items():
         url = url.replace(f"{{{key}}}", str(val))
     return url
 
 
 def _build_headers(endpoint: EndpointDescriptor, extra: dict | None = None) -> dict[str, str]:
-    """Build request headers from template + extras."""
-    headers = dict(endpoint.headers_template or {})
+    headers = {k: v for k, v in (endpoint.headers_template or {}).items() if is_replay_header(k)}
+    headers["User-Agent"] = config.REBROWSE_UA
     if extra:
         headers.update(extra)
-    # Ensure we have standard headers
-    if "user-agent" not in {k.lower() for k in headers}:
-        headers["User-Agent"] = config.CHROME_UA
     return headers
 
 
-def _build_cookies_header(cookies: list[dict]) -> str:
-    """Build Cookie header string from cookie list."""
+def _cookie_header(cookies: list[dict], host: str) -> str:
     parts = []
     for c in cookies:
-        name = c.get("name", "")
-        value = c.get("value", "")
-        if name and value:
+        name, value = c.get("name"), c.get("value")
+        domain = (c.get("domain") or "").lstrip(".").lower()
+        if name and value and (not domain or host == domain or host.endswith("." + domain)):
             parts.append(f"{name}={value}")
     return "; ".join(parts)
+
+
+def _body_kwargs(endpoint: EndpointDescriptor, headers: dict[str, str]) -> dict:
+    body = endpoint.body
+    if body is None or endpoint.method in (HttpMethod.GET, HttpMethod.DELETE):
+        return {}
+    ctype = next((v for k, v in headers.items() if k.lower() == "content-type"), "").lower()
+    if "application/x-www-form-urlencoded" in ctype and isinstance(body, dict):
+        return {"data": body}
+    if isinstance(body, (dict, list)):
+        return {"json": body}
+    return {"content": str(body)}
+
+
+def _apply_credentials(skill: SkillManifest, url: str, headers: dict, query: dict) -> None:
+    host = (urlparse(url).hostname or "").lower()
+    first_party = same_site(url, skill.domain)
+
+    cookies = get_cookies(skill.domain) if first_party else None
+    if cookies:
+        cookie = _cookie_header(cookies, host)
+        if cookie:
+            headers["Cookie"] = cookie
+
+    key = get_api_key(host) or (get_api_key(skill.domain) if first_party else None)
+    if not key:
+        return
+    if key.get("auth_type") == "header":
+        headers["X-API-Key"] = key["key"]
+    elif key.get("auth_type") == "query":
+        query["api_key"] = key["key"]
+    else:
+        headers["Authorization"] = f"Bearer {key['key']}"
+
+
+async def _pace(host: str) -> None:
+    interval = config.HOST_MIN_INTERVAL_S
+    if interval <= 0:
+        return
+    now = time.monotonic()
+    wait = _last_request_at.get(host, 0.0) + interval - now
+    _last_request_at[host] = now + max(wait, 0.0)
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+
+def blocked_reason(resp: httpx.Response) -> str | None:
+    if resp.status_code not in (401, 403, 429, 503):
+        return None
+    ctype = resp.headers.get("content-type", "")
+    if "html" not in ctype and "text/plain" not in ctype:
+        return None
+    head = resp.text[:4000].lower()
+    marker = next((m for m in CHALLENGE_MARKERS if m in head), None)
+    if not marker:
+        return None
+    return f"blocked: the site refused automated access (HTTP {resp.status_code}, '{marker}')"
+
+
+def _parse_result(resp: httpx.Response) -> tuple[object, bool]:
+    try:
+        return resp.json(), False
+    except ValueError:
+        text = resp.text
+        if len(text) > config.MAX_RESULT_CHARS:
+            return text[:config.MAX_RESULT_CHARS], True
+        return text, False
 
 
 async def execute_endpoint(
@@ -56,131 +126,59 @@ async def execute_endpoint(
     endpoint: EndpointDescriptor,
     params: dict | None = None,
     extra_headers: dict | None = None,
+    confirmed: bool = False,
 ) -> ExecutionTrace:
-    """Execute a single endpoint with retry logic."""
-    trace = ExecutionTrace(
-        skill_id=skill.skill_id,
-        endpoint_id=endpoint.endpoint_id,
-    )
+    trace = ExecutionTrace(skill_id=skill.skill_id, endpoint_id=endpoint.endpoint_id)
+
+    eff = endpoint.get_effect()
+    if eff is not Effect.READ and not confirmed:
+        trace.error = (
+            f"confirmation_required: '{endpoint.method.value} {endpoint.url_template}' is a "
+            f"{eff.value} operation and was NOT executed. Confirm explicitly to proceed."
+        )
+        trace.completed_at = _now()
+        return trace
 
     url = _build_url(endpoint, params)
     headers = _build_headers(endpoint, extra_headers)
-
-    # Try to get cookies for the domain
-    cookies_list = get_cookies(skill.domain)
-    if not cookies_list:
-        # Try extracting from browser
-        extraction = extract_browser_cookies(skill.domain)
-        if extraction.cookies:
-            cookies_list = [
-                {"name": c.name, "value": c.value, "domain": c.domain}
-                for c in extraction.cookies
-            ]
-
-    if cookies_list:
-        headers["Cookie"] = _build_cookies_header(cookies_list)
-
-    # Inject API key if stored for this domain
-    api_key_info = get_api_key(skill.domain)
-    if api_key_info:
-        auth_type = api_key_info.get("auth_type", "bearer")
-        key_value = api_key_info["key"]
-        if auth_type == "bearer":
-            headers["Authorization"] = f"Bearer {key_value}"
-        elif auth_type == "header":
-            headers["X-API-Key"] = key_value
-        # "query" type is handled below when building query params
-
-    # Build query params
     query = dict(endpoint.query or {})
-    if api_key_info and api_key_info.get("auth_type") == "query":
-        query["api_key"] = api_key_info["key"]
-    body = endpoint.body
+    _apply_credentials(skill, url, headers, query)
+    body = _body_kwargs(endpoint, headers)
+    host = (urlparse(url).hostname or "").lower()
+    # A write that timed out may already have applied, so only reads are retried.
+    retries = MAX_RETRIES if eff is Effect.READ else 0
 
-    last_error = None
-    for attempt in range(MAX_RETRIES + 1):
-        try:
-            if endpoint.method == HttpMethod.GET:
-                resp = await _http.get(url, headers=headers, params=query)
-            elif endpoint.method == HttpMethod.POST:
-                resp = await _http.post(url, headers=headers, params=query, json=body)
-            elif endpoint.method == HttpMethod.PUT:
-                resp = await _http.put(url, headers=headers, params=query, json=body)
-            elif endpoint.method == HttpMethod.PATCH:
-                resp = await _http.patch(url, headers=headers, params=query, json=body)
-            elif endpoint.method == HttpMethod.DELETE:
-                resp = await _http.delete(url, headers=headers, params=query)
-            else:
-                resp = await _http.get(url, headers=headers, params=query)
+    async with net.client(TIMEOUT_S, follow_redirects=True) as client:
+        for attempt in range(retries + 1):
+            await _pace(host)
+            try:
+                resp = await client.request(
+                    endpoint.method.value, url, headers=headers, params=query, **body)
+            except httpx.TimeoutException as e:
+                trace.error = f"timeout: {e}"
+                if attempt < retries:
+                    await asyncio.sleep(min(BASE_DELAY * 2 ** attempt, MAX_DELAY))
+                    continue
+                break
+            except httpx.HTTPError as e:
+                trace.error = f"{type(e).__name__}: {e}"
+                break
 
             trace.status_code = resp.status_code
-
-            if resp.status_code in RETRYABLE_STATUSES and attempt < MAX_RETRIES:
-                delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
-                await asyncio.sleep(delay)
+            if resp.status_code in RETRYABLE_STATUSES and attempt < retries:
+                await asyncio.sleep(min(BASE_DELAY * 2 ** attempt, MAX_DELAY))
                 continue
 
-            # Parse response
-            try:
-                trace.result = resp.json()
-            except Exception:
-                trace.result = resp.text
-
-            trace.success = 200 <= resp.status_code < 400
-            trace.completed_at = _now()
+            trace.result, trace.truncated = _parse_result(resp)
+            blocked = blocked_reason(resp)
+            trace.success = blocked is None and 200 <= resp.status_code < 400
+            if blocked:
+                trace.error = blocked
+            elif not trace.success:
+                trace.error = f"HTTP {resp.status_code}"
+            else:
+                trace.error = None
             break
 
-        except httpx.TimeoutException as e:
-            last_error = f"Timeout: {e}"
-            if attempt < MAX_RETRIES:
-                delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
-                await asyncio.sleep(delay)
-                continue
-        except Exception as e:
-            last_error = str(e)
-            break
-
-    if not trace.success and not trace.completed_at:
-        trace.error = last_error or "Unknown error"
-        trace.completed_at = _now()
-
+    trace.completed_at = _now()
     return trace
-
-
-async def execute_skill(
-    skill: SkillManifest,
-    intent: str = "",
-    params: dict | None = None,
-) -> ExecutionTrace:
-    """
-    Execute the best matching endpoint in a skill.
-    Uses simple keyword matching against endpoint URLs and descriptions.
-    """
-    if not skill.endpoints:
-        return ExecutionTrace(
-            skill_id=skill.skill_id,
-            endpoint_id="none",
-            error="Skill has no endpoints",
-            completed_at=_now(),
-        )
-
-    # Rank endpoints by intent match
-    best = skill.endpoints[0]
-    best_score = 0.0
-
-    if intent:
-        intent_words = set(intent.lower().split())
-        for ep in skill.endpoints:
-            score = 0.0
-            url_words = set(ep.url_template.lower().replace("/", " ").replace("-", " ").replace("_", " ").split())
-            score += len(intent_words & url_words) * 2
-            if ep.description:
-                desc_words = set(ep.description.lower().split())
-                score += len(intent_words & desc_words) * 3
-            if ep.method == HttpMethod.GET:
-                score += 1
-            if score > best_score:
-                best_score = score
-                best = ep
-
-    return await execute_endpoint(skill, best, params)
