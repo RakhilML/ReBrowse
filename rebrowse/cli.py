@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import socket
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import click
 
@@ -35,6 +38,7 @@ def main():
       run <prompt>      pick a saved API for a request and call it
       verify <target>   health-check a skill's read endpoints
       openapi <target>  export a skill as an OpenAPI 3.1 document
+      mock <source>     serve recorded API responses on localhost
       mcp               serve skills to agents over MCP (stdio)
     """
     ensure_dirs()
@@ -134,6 +138,64 @@ def openapi(target: str, out: Path | None):
         "paths": len(document["paths"]),
         "operations": sum(len(methods) for methods in document["paths"].values()),
     })
+
+
+def _port_taken(port: int) -> bool:
+    with socket.socket() as probe:
+        probe.settimeout(0.5)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _netloc(text: str) -> str:
+    return urlsplit(text).netloc if "://" in text else text
+
+
+@main.command(short_help="Serve recorded API responses on 127.0.0.1.")
+@click.argument("source")
+@click.option("--domain", "-d", default=None, metavar="HOST[:PORT]",
+              help="Site in a HAR to mock (default: host of the first HTML page).")
+@click.option("--port", "-p", type=click.IntRange(0, 65535), default=8787, show_default=True,
+              help="Port on 127.0.0.1; 0 picks a free one.")
+def mock(source: str, domain: str | None, port: int):
+    """Answer a frontend's API calls from recorded traffic, on 127.0.0.1 only.
+
+    SOURCE is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
+    capture is used. Requests are matched on templated paths and GraphQL operations.
+    Nothing is forwarded to the real site, secret-named values in responses are redacted,
+    and no recorded header but content-type is sent back.
+    """
+    from rebrowse.capture.store import latest_capture, load_traffic, saved_domains
+    from rebrowse.mock import MockServer, build_routes, route_table
+
+    path: Path | None = Path(source)
+    if not path.is_file():
+        path = latest_capture(_netloc(source))
+    if path is None:
+        saved = ", ".join(saved_domains()) or "none"
+        _emit({"error": f"'{source}' is neither a file nor a domain with a saved capture "
+                        f"(saved: {saved}). For an imported HAR, pass the HAR file."})
+        return
+    try:
+        capture = load_traffic(path, _netloc(domain) if domain else None)
+    except ValueError as e:
+        _emit({"error": str(e)})
+        return
+    routes = build_routes(capture)
+    if not routes:
+        _emit({"error": f"No API responses for {capture.domain} in {path}"})
+        return
+    try:
+        if port and _port_taken(port):
+            raise OSError("port is already in use")
+        server = MockServer(routes, port)
+    except OSError as e:
+        _emit({"error": f"Cannot listen on 127.0.0.1:{port}: {e}"})
+        return
+    _emit({"url": server.url, "domain": capture.domain, "source": str(path.resolve()),
+           "routes": route_table(routes)})
+    sys.stdout.flush()
+    with server, contextlib.suppress(KeyboardInterrupt):
+        server.serve_forever()
 
 
 @main.command()

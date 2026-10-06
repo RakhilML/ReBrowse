@@ -44,6 +44,7 @@ rebrowse run "add a note saying hi" --yes          # confirm a call that changes
 
 rebrowse verify news.ycombinator.com               # health-check a skill's read endpoints
 rebrowse openapi news.ycombinator.com -o api.json  # OpenAPI 3.1 export (stdout without -o)
+rebrowse mock e2e.har [-p 8787]                    # serve the recorded API on 127.0.0.1
 rebrowse skills [-q "search"]  |  rebrowse show <id>  |  rebrowse delete <id>
 rebrowse auth set api.github.com ghp_xxx [--type bearer|header|query]
 rebrowse mcp                                       # MCP server over stdio
@@ -125,6 +126,51 @@ the e2e run and let `git diff` report drift (descriptions come from the LLM and
 ```bash
 rebrowse import-har e2e.har && rebrowse openapi app.local -o api.json
 ```
+
+## Mock server
+
+`rebrowse mock SOURCE` answers a frontend's API calls from recorded traffic, so the UI,
+Storybook or an e2e suite can run without the real backend. SOURCE is a HAR file, a capture
+saved by `build`, or a `host[:port]` whose newest saved capture is used (`--domain` picks the
+site in a HAR, as for `import-har`):
+
+```bash
+rebrowse mock e2e.har                                     # http://127.0.0.1:8787
+rebrowse build http://localhost:8080 && rebrowse mock localhost:8080 -p 0
+```
+
+Point the app's API base URL, or its dev-server proxy, at the printed `url`. The route table
+is printed to stdout as JSON at startup, and each request is logged to stderr with how it was
+answered.
+
+- **Matching.** Routes are the endpoints the skill and the OpenAPI export see: same-site API
+  calls with ids templated and one route per GraphQL operation, including persisted queries
+  and GET `?query=` (a batch only matches the same operations in the same order). An unseen
+  id is answered from its template (`/api/users/999` gets the recorded `/api/users/1001`),
+  and a literal route beats a template (`/users/me` over `/users/{id}`). Routes on sibling
+  hosts stay apart; a path recorded on several hosts is answered from the site's own host and
+  marked `nearest`. Within a route the closest recording wins: one with a body over one whose
+  body was not recorded (DevTools drops them after a navigation; an empty body counts as
+  recorded), same path, most shared query pairs, fewest recorded pairs missing from the
+  request, then the same for top-level body fields (so `action=save_post` picks the
+  `save_post` recording of an RPC endpoint), same body, then a 2xx over an error. Responses carry `x-rebrowse-mock: exact|nearest` and `x-rebrowse-route`, and the
+  stderr log adds `no body recorded` when the only recording has none. Anything else is a 404
+  with `x-rebrowse-mock: miss` and the list of recorded routes; an unrecorded GraphQL operation
+  is a miss, never another operation's data.
+- **What is served.** The recorded status and body with its `content-type` (dropped unless it
+  is printable ASCII), and no other recorded header, so no `Set-Cookie`. Bodies are sent as
+  UTF-8 and a recorded `charset` is rewritten to match. JSON values under secret-looking keys
+  (`access_token`, `password`, ...) are replaced by `<redacted>`, also behind a BOM, an XSSI
+  guard such as `)]}'` or a JSONP callback, and form-encoded bodies are redacted pair by pair;
+  other text bodies, such as XML, are served as recorded. Redirects and
+  304s are skipped, as are static files, telemetry and other sites. `HEAD` is not supported.
+- **Never the real site.** The mock has no HTTP client: writes get their recorded response
+  and nothing is forwarded. It keeps no state either, so a POST does not change what a later
+  GET returns.
+- **Local only.** It binds 127.0.0.1, refuses requests whose `Host` is not a loopback name
+  (DNS rebinding), answers CORS, with credentials, only for `localhost`, `127.0.0.1` and
+  `[::1]` origins, and refuses cross-site requests from pages that are not on localhost, so
+  another website cannot read it through a `<script>` tag.
 
 ## Safety model
 
