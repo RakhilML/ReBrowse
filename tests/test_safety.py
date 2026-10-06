@@ -4,7 +4,7 @@ import pytest
 
 from rebrowse.execution.executor import execute_endpoint
 from rebrowse.models import EndpointDescriptor, HttpMethod, SkillManifest
-from rebrowse.safety import REDACTED, Effect, classify_effect, is_secret_name, redact
+from rebrowse.safety import REDACTED, Effect, classify_effect, is_secret_name, redact, redact_body
 
 
 @pytest.mark.parametrize("method,url,body,expected", [
@@ -58,6 +58,13 @@ def test_redact_hides_values_of_secret_named_pairs():
                              {"name": "password", "value": REDACTED}]
 
 
+@pytest.mark.parametrize("guard", [
+    ")]}'\n", ")]}',\n", ")]}'\r\n", ")]}\n", "while(1);", "for(;;);", "for (;;);",
+])
+def test_redact_keeps_an_xssi_guard_and_hides_what_follows(guard):
+    assert redact(f'{guard}{{"token": "t", "id": 7}}') == f'{guard}{{"token":"{REDACTED}","id":7}}'
+
+
 def test_redact_returns_unchanged_text_as_is():
     text = '{ "id": 7,  "tags": ["a"] }'
     assert redact(text) is text
@@ -89,3 +96,12 @@ async def test_write_executes_when_confirmed(fixture_site):
     trace = await execute_endpoint(_skill(), ep, confirmed=True)
     assert trace.success is True
     assert trace.result["method"] == "POST"
+
+
+def test_redact_body_handles_a_bom_jsonp_and_form_responses():
+    assert redact('\ufeff{"token": "t"}') == f'\ufeff{{"token":"{REDACTED}"}}'
+    assert redact_body('/**/cb({"token": "t"})', "text/javascript") == (
+        f'/**/cb({{"token":"{REDACTED}"}})')
+    assert redact_body("token=t&n=1", "application/x-www-form-urlencoded") == (
+        "token=%3Credacted%3E&n=1")
+    assert redact_body("cb(1)") == "cb(1)"

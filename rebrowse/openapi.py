@@ -16,9 +16,8 @@ from rebrowse.reverse.extractor import (
     is_replay_header,
     schema_from_values,
 )
-from rebrowse.safety import REDACTED, is_secret_name, redact
+from rebrowse.safety import FORM, REDACTED, is_secret_name, redact
 
-FORM = "application/x-www-form-urlencoded"
 METHOD_ORDER = ("get", "post", "put", "patch", "delete")
 BROWSER_HEADERS = frozenset({
     "content-type", "accept", "accept-language", "referer", "origin",

@@ -6,7 +6,7 @@ import json
 import re
 from enum import Enum
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 
 class Effect(str, Enum):
@@ -50,6 +50,10 @@ _BENIGN_KEY_QUALIFIERS = frozenset({
     "group", "lookup", "hot", "composite", "natural", "unique", "map", "dedupe",
 })
 _NOT_KEYS = frozenset({"monkey", "turkey", "donkey", "hockey", "jockey", "whiskey"})
+_XSSI_GUARDS = (")]}',", ")]}'", ")]}", "while(1);", "for(;;);", "for (;;);")
+_JSONP = re.compile(r"(\s*(?:/\*\*/)?\s*[\w$.]+\s*\(\s*)(.*?)(\s*\)\s*;?\s*)", re.DOTALL)
+_CAS_TICKETS = ("ST-", "PT-")
+FORM = "application/x-www-form-urlencoded"
 
 
 def _words(text: str) -> set[str]:
@@ -119,15 +123,27 @@ def is_secret_name(name: str) -> bool:
     return any(_secret_word(w, words[i - 1] if i else None) for i, w in enumerate(words))
 
 
+def split_xssi(text: str) -> tuple[str, str]:
+    """Split a BOM or an anti-hijacking guard such as )]}' off the front of a JSON response."""
+    bom = "\ufeff" if text.startswith("\ufeff") else ""
+    body = text[len(bom):]
+    for guard in _XSSI_GUARDS:
+        if body.startswith(guard):
+            rest = body[len(guard):].lstrip()
+            return text[:len(text) - len(rest)], rest
+    return bom, body
+
+
 def _redact_json_text(text: str) -> str:
+    guard, rest = split_xssi(text)
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(rest)
     except ValueError:
         return text
     if not isinstance(parsed, (dict, list)):
         return text
     redacted = redact(parsed)
-    return text if redacted == parsed else json.dumps(redacted, separators=(",", ":"))
+    return text if redacted == parsed else guard + json.dumps(redacted, separators=(",", ":"))
 
 
 def _named_secret(pair: dict) -> bool:
@@ -144,3 +160,24 @@ def redact(value: Any) -> Any:
     if isinstance(value, str):
         return _redact_json_text(value)
     return value
+
+
+def _secret_pair(name: str, value: str, names: set[str]) -> bool:
+    low = name.lower()
+    return (is_secret_name(name) or (low == "code" and "state" in names)
+            or (low == "ticket" and value.startswith(_CAS_TICKETS)))
+
+
+def redact_pairs(text: str) -> str:
+    pairs = parse_qsl(text, keep_blank_values=True)
+    names = {k.lower() for k, _ in pairs}
+    redacted = [(redact(k), REDACTED if _secret_pair(k, v, names) else redact(v)) for k, v in pairs]
+    return text if redacted == pairs else urlencode(redacted)
+
+
+def redact_body(text: str, content_type: str = "") -> str:
+    if FORM in content_type.lower():
+        return redact_pairs(text)
+    if (wrapped := _JSONP.fullmatch(text)) and wrapped[2].startswith(("{", "[")):
+        return wrapped[1] + redact(wrapped[2]) + wrapped[3]
+    return redact(text)

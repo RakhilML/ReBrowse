@@ -13,24 +13,25 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from rebrowse import config
 from rebrowse.models import CaptureResult, RawRequest
 from rebrowse.reverse.extractor import is_replay_header, is_sensitive_header, registrable_domain
-from rebrowse.safety import REDACTED, is_secret_name, redact
+from rebrowse.safety import FORM, is_secret_name, redact, redact_pairs
 
-FORM = "application/x-www-form-urlencoded"
 _CREDENTIAL_VALUE = re.compile(
     r"(bearer|basic|token|digest|negotiate|ntlm|hmac)\s|eyJ[\w-]+\.[\w-]+\.", re.IGNORECASE)
 _JSONP_PARAMS = frozenset({"callback", "jsonp", "cb"})
-_CAS_TICKETS = ("ST-", "PT-")
 
 
 class HarError(ValueError):
     pass
 
 
-def _entries(path: Path) -> list:
+def read_json(path: Path) -> Any:
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, RecursionError) as e:
         raise HarError(f"Cannot read {path} as JSON: {e}") from e
+
+
+def _entries(data: Any, path: Path) -> list:
     log = data.get("log") if isinstance(data, dict) else None
     entries = log.get("entries") if isinstance(log, dict) else None
     if not isinstance(entries, list):
@@ -40,19 +41,6 @@ def _entries(path: Path) -> list:
 
 def _dicts(value: Any) -> list[dict]:
     return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
-
-
-def _secret_pair(name: str, value: str, names: set[str]) -> bool:
-    low = name.lower()
-    return (is_secret_name(name) or (low == "code" and "state" in names)
-            or (low == "ticket" and value.startswith(_CAS_TICKETS)))
-
-
-def _redact_pairs(text: str) -> str:
-    pairs = parse_qsl(text, keep_blank_values=True)
-    names = {k.lower() for k, _ in pairs}
-    redacted = [(redact(k), REDACTED if _secret_pair(k, v, names) else redact(v)) for k, v in pairs]
-    return text if redacted == pairs else urlencode(redacted)
 
 
 def _clean_segment(segment: str) -> str:
@@ -70,7 +58,7 @@ def _clean_url(url: str) -> str | None:
         return None
     netloc = parts.netloc.rpartition("@")[2]
     path = "/".join(_clean_segment(s) for s in parts.path.split("/"))
-    query = _redact_pairs(parts.query)
+    query = redact_pairs(parts.query)
     if (netloc, path, query) == (parts.netloc, parts.path, parts.query):
         return url
     return urlunsplit(parts._replace(netloc=netloc, path=path, query=query))
@@ -125,7 +113,7 @@ def _request_body(post: Any, content_type: str) -> str | None:
     try:
         json.loads(text)
     except ValueError:
-        return _redact_pairs(text) if FORM in mime else None
+        return redact_pairs(text) if FORM in mime else None
     return redact(text)
 
 
@@ -223,10 +211,14 @@ def _site(requests: list[RawRequest], urls: list[str], domain: str | None) -> tu
 
 
 def load_har(path: str | Path, domain: str | None = None) -> CaptureResult:
+    return har_capture(read_json(Path(path)), Path(path), domain)
+
+
+def har_capture(data: Any, path: Path, domain: str | None = None) -> CaptureResult:
     requests: list[RawRequest] = []
     scripts: dict[str, str] = {}
     urls: list[str] = []
-    for url, request, response in _exchanges(_entries(Path(path))):
+    for url, request, response in _exchanges(_entries(data, path)):
         urls.append(url)
         content_type = _content_type(response)
         if _is_script(url, content_type):
