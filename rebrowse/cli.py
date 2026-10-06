@@ -1,184 +1,191 @@
-"""CLI entry point — two commands: build and run."""
+"""rebrowse command-line interface."""
 
 from __future__ import annotations
+
 import asyncio
 import json
 import sys
-import os
+
 import click
+
 from rebrowse.config import ensure_dirs
 
-# Fix Windows console encoding for unicode
 if sys.platform == "win32":
-    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
 
-def _run(coro):
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
+def _emit(result: dict) -> None:
+    print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+    if result.get("error") and not result.get("success"):
+        sys.exit(1)
 
 
 @click.group()
 def main():
-    """rebrowse — Local API reverse-engineering for browsers.
+    """rebrowse — learn a website's internal APIs, then call them directly.
 
-    Two commands:
-
-      build <url>     Capture a website, extract its APIs, save as a skill.
-
-      run <prompt>    Search skills, pick the right API, execute it.
+    \b
+      build <url>       capture a site and save its APIs as a skill
+      run <prompt>      pick a saved API for a request and call it
+      verify <target>   health-check a skill's read endpoints
+      mcp               serve skills to agents over MCP (stdio)
     """
     ensure_dirs()
 
 
 @main.command()
 @click.argument("url")
-def build(url: str):
-    """Capture a website and reverse-engineer its APIs into a skill.
-
-    Examples:
-
-      python -m rebrowse build https://github.com/trending
-
-      python -m rebrowse build https://news.ycombinator.com
-    """
+@click.option("--steps", "-s", default=None,
+              help='Interactions that trigger more APIs, e.g. "type #q=cats; click #go".')
+def build(url: str, steps: str | None):
+    """Capture a website and reverse-engineer its APIs into a skill."""
+    from rebrowse.capture.steps import parse_steps
     from rebrowse.orchestrator.pipeline import build as do_build
 
-    if not url.startswith("http"):
+    try:
+        parse_steps(steps)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="--steps")
+    if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
-
-    result = _run(do_build(url))
-    print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+    _emit(asyncio.run(do_build(url, steps=steps)))
 
 
 @main.command()
 @click.argument("prompt")
-def run(prompt: str):
-    """Search stored skills and execute the best matching API.
+@click.option("--dry-run", "-n", is_flag=True, help="Resolve the plan without sending anything.")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, help="Confirm write/destructive calls.")
+def run(prompt: str, dry_run: bool, assume_yes: bool):
+    """Pick the saved API that matches PROMPT and call it.
 
-    Examples:
-
-      python -m rebrowse run "get trending repos from github"
-
-      python -m rebrowse run "show top stories on hacker news"
+    Read-only calls run directly; calls that change state need --yes.
     """
     from rebrowse.orchestrator.pipeline import run as do_run
 
-    result = _run(do_run(prompt))
-    print(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+    _emit(asyncio.run(do_run(prompt, dry_run=dry_run, assume_yes=assume_yes)))
 
 
 @main.command()
-@click.option("--query", "-q", default=None, help="Semantic search query")
-def skills(query: str):
-    """List or search stored skills."""
+@click.argument("target")
+def verify(target: str):
+    """Re-check a skill's read endpoints and record which still work.
+
+    TARGET is a skill id or domain. Writes are never executed. Requests are paced per
+    host (REBROWSE_HOST_INTERVAL seconds, default 1).
+    """
+    from rebrowse.orchestrator.pipeline import verify as do_verify
+
+    _emit(asyncio.run(do_verify(target)))
+
+
+@main.command()
+@click.option("--query", "-q", default=None, help="Semantic search query.")
+def skills(query: str | None):
+    """List or search saved skills."""
     from rebrowse.store.skills import list_all_skills, search_skills
 
     if query:
-        results = search_skills(query, limit=10)
-        for skill, score in results:
-            print(f"  [{score:.3f}] {skill.skill_id}  {skill.domain}  ({len(skill.endpoints)} endpoints)")
-    else:
-        all_skills = list_all_skills()
-        if not all_skills:
-            print("No skills stored yet. Run 'build' on a URL first.")
-            return
-        for s in all_skills:
-            print(f"  {s.skill_id}  {s.domain}  ({len(s.endpoints)} endpoints)  {s.updated_at}")
+        for skill, score in search_skills(query, limit=10):
+            click.echo(f"  [{score:.3f}] {skill.skill_id}  {skill.domain}  "
+                       f"({len(skill.endpoints)} endpoints)")
+        return
+    all_skills = list_all_skills()
+    if not all_skills:
+        click.echo("No skills stored yet. Run 'build' on a URL first.")
+    for s in all_skills:
+        click.echo(f"  {s.skill_id}  {s.domain}  ({len(s.endpoints)} endpoints)  {s.updated_at}")
 
 
 @main.command()
 @click.argument("skill_id")
 def show(skill_id: str):
-    """Show full details of a stored skill."""
+    """Show a saved skill as JSON."""
     from rebrowse.store.skills import list_all_skills
 
-    for s in list_all_skills():
-        if s.skill_id == skill_id:
-            print(json.dumps(s.model_dump(), indent=2, default=str))
-            return
-    print(f"Skill {skill_id} not found.", file=sys.stderr)
+    skill = next((s for s in list_all_skills() if s.skill_id == skill_id), None)
+    if skill is None:
+        raise click.ClickException(f"Skill {skill_id} not found.")
+    click.echo(json.dumps(skill.model_dump(mode="json"), indent=2))
 
 
 @main.command()
 @click.argument("skill_id")
 def delete(skill_id: str):
-    """Delete a stored skill."""
+    """Delete a saved skill."""
     from rebrowse.store.skills import delete_skill
 
-    if delete_skill(skill_id):
-        print(f"Deleted {skill_id}")
-    else:
-        print(f"Skill {skill_id} not found.", file=sys.stderr)
+    if not delete_skill(skill_id):
+        raise click.ClickException(f"Skill {skill_id} not found.")
+    click.echo(f"Deleted {skill_id}")
+
+
+@main.command()
+def mcp():
+    """Serve saved skills to agents over MCP (stdio).
+
+    Tools: search_skills, list_operations, read (read-only), act (needs confirm=true).
+    """
+    from rebrowse.mcp_server import main as run_server
+
+    run_server()
 
 
 @main.group()
 def auth():
-    """Manage API keys and credentials for domains."""
-    pass
+    """Manage API keys for domains."""
 
 
 @auth.command("set")
 @click.argument("domain")
 @click.argument("key")
-@click.option(
-    "--type", "-t", "auth_type",
-    type=click.Choice(["bearer", "header", "query"]),
-    default="bearer",
-    help="How to send the key: bearer (Authorization header), header (X-API-Key), or query (?api_key=...)",
-)
+@click.option("--type", "-t", "auth_type", type=click.Choice(["bearer", "header", "query"]),
+              default="bearer", show_default=True,
+              help="bearer: Authorization header; header: X-API-Key; query: ?api_key=")
 def auth_set(domain: str, key: str, auth_type: str):
-    """Store an API key for a domain.
+    """Store an API key, sent only to DOMAIN (and same-site hosts of skills built on it).
 
-    Examples:
-
-      python -m rebrowse auth set api.openai.com sk-abc123
-
+    \b
+      python -m rebrowse auth set api.github.com ghp_xxx
       python -m rebrowse auth set maps.googleapis.com AIza... --type query
-
-      python -m rebrowse auth set api.github.com ghp_xxx --type header
     """
-    from rebrowse.auth.vault import store_api_key
+    from rebrowse.auth.vault import VaultError, store_api_key
 
-    store_api_key(domain, key, auth_type)
-    print(f"Stored {auth_type} API key for {domain}")
+    try:
+        store_api_key(domain, key, auth_type)
+    except VaultError as e:
+        raise click.ClickException(str(e))
+    click.echo(f"Stored {auth_type} API key for {domain}")
 
 
 @auth.command("remove")
 @click.argument("domain")
 def auth_remove(domain: str):
-    """Remove a stored API key for a domain."""
-    from rebrowse.auth.vault import delete_api_key
+    """Remove a stored API key."""
+    from rebrowse.auth.vault import VaultError, delete_api_key
 
-    if delete_api_key(domain):
-        print(f"Removed API key for {domain}")
-    else:
-        print(f"No API key found for {domain}", file=sys.stderr)
+    try:
+        removed = delete_api_key(domain)
+    except VaultError as e:
+        raise click.ClickException(str(e))
+    if not removed:
+        raise click.ClickException(f"No API key found for {domain}")
+    click.echo(f"Removed API key for {domain}")
 
 
 @auth.command("list")
 def auth_list():
-    """List all domains with stored API keys."""
+    """List domains with stored API keys."""
     from rebrowse.auth.vault import list_api_keys
 
     domains = list_api_keys()
     if not domains:
-        print("No API keys stored.")
-        return
+        click.echo("No API keys stored.")
     for d in domains:
-        print(f"  {d}")
+        click.echo(f"  {d}")
 
 
 if __name__ == "__main__":
