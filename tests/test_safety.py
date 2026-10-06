@@ -4,7 +4,7 @@ import pytest
 
 from rebrowse.execution.executor import execute_endpoint
 from rebrowse.models import EndpointDescriptor, HttpMethod, SkillManifest
-from rebrowse.safety import Effect, classify_effect
+from rebrowse.safety import REDACTED, Effect, classify_effect, is_secret_name, redact
 
 
 @pytest.mark.parametrize("method,url,body,expected", [
@@ -28,6 +28,40 @@ def test_classify_effect(method, url, body, expected):
 
 def test_word_boundary_no_false_positive():
     assert classify_effect("GET", "https://x.com/v1/soundtracks", None) == Effect.READ
+
+
+@pytest.mark.parametrize("name,secret", [
+    ("password", True), ("access_token", True), ("apiKey", True), ("client_secret", True),
+    ("x-auth", True), ("csrfToken", True), ("pw", True), ("new_pw", True),
+    ("j_password", True), ("SAMLResponse", True), ("SAMLRequest", True), ("assertion", True),
+    ("client_assertion", True), ("Authentication", True), ("X-Authentication", True),
+    ("authn", True), ("SAMLart", True),
+    ("sort_key", False), ("monkey", False), ("username", False), ("q", False),
+    ("operationName", False), ("RelayState", False),
+])
+def test_is_secret_name(name, secret):
+    assert is_secret_name(name) is secret
+
+
+def test_redact_hides_nested_keys_and_json_encoded_strings():
+    value = {"user": "ann", "auth": {"token": "t"}, "rows": [{"apiKey": "k", "n": 1}],
+             "variables": '{"password":"p","id":7}'}
+
+    assert redact(value) == {
+        "user": "ann", "auth": REDACTED, "rows": [{"apiKey": REDACTED, "n": 1}],
+        "variables": f'{{"password":"{REDACTED}","id":7}}'}
+
+
+def test_redact_hides_values_of_secret_named_pairs():
+    pairs = [{"name": "user", "value": "ann"}, {"name": "password", "value": "p"}]
+    assert redact(pairs) == [{"name": "user", "value": "ann"},
+                             {"name": "password", "value": REDACTED}]
+
+
+def test_redact_returns_unchanged_text_as_is():
+    text = '{ "id": 7,  "tags": ["a"] }'
+    assert redact(text) is text
+    assert redact("not json") == "not json"
 
 
 def _skill(domain="127.0.0.1"):

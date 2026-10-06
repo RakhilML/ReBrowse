@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from collections import Counter
 from collections.abc import Iterable
@@ -17,8 +16,8 @@ from rebrowse.reverse.extractor import (
     is_replay_header,
     schema_from_values,
 )
+from rebrowse.safety import REDACTED, is_secret_name, redact
 
-REDACTED = "<redacted>"
 FORM = "application/x-www-form-urlencoded"
 METHOD_ORDER = ("get", "post", "put", "patch", "delete")
 BROWSER_HEADERS = frozenset({
@@ -29,16 +28,6 @@ BROWSER_HEADERS = frozenset({
 _EFFECT_RANK = {"read": 0, "write": 1, "destructive": 2}
 _HEALTH_RANK = {"verified": 0, "unverified": 1, "failed": 2}
 _WORD = re.compile(r"[A-Za-z0-9]+")
-_NAME_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")
-_SECRET_FRAGMENT = re.compile(
-    r"token|secret|passw|passcode|passphrase|pwd|credential|session|sessid|csrf|xsrf|cookie"
-    r"|jwt|bearer|signature|apikey")
-_SECRET_WORDS = frozenset({"auth", "authorization", "pass", "otp", "sid", "sig"})
-_BENIGN_KEY_QUALIFIERS = frozenset({
-    "sort", "primary", "foreign", "public", "partition", "cache", "idempotency", "row",
-    "group", "lookup", "hot", "composite", "natural", "unique", "map", "dedupe",
-})
-_NOT_KEYS = frozenset({"monkey", "turkey", "donkey", "hockey", "jockey", "whiskey"})
 
 
 def _origin(ep: EndpointDescriptor) -> str:
@@ -59,41 +48,8 @@ def _observed(ep: EndpointDescriptor) -> bool:
     return ep.trigger_url is not None
 
 
-def _secret_word(word: str, previous: str | None) -> bool:
-    stem = word.removesuffix("s")
-    if stem.endswith("key") and stem not in _NOT_KEYS:
-        return (stem[:-3] or previous) not in _BENIGN_KEY_QUALIFIERS
-    return word in _SECRET_WORDS or bool(_SECRET_FRAGMENT.search(word))
-
-
-def _sensitive(name: str) -> bool:
-    words = [w.lower() for w in _NAME_WORD.findall(name)]
-    return any(_secret_word(w, words[i - 1] if i else None) for i, w in enumerate(words))
-
-
-def _redact_json_text(text: str) -> str:
-    try:
-        parsed = json.loads(text)
-    except ValueError:
-        return text
-    if not isinstance(parsed, (dict, list)):
-        return text
-    redacted = _redact(parsed)
-    return text if redacted == parsed else json.dumps(redacted, separators=(",", ":"))
-
-
-def _redact(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: REDACTED if _sensitive(str(k)) else _redact(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_redact(v) for v in value]
-    if isinstance(value, str):
-        return _redact_json_text(value)
-    return value
-
-
 def _example(name: str, value: Any) -> Any:
-    return REDACTED if _sensitive(name) else _redact(value)
+    return REDACTED if is_secret_name(name) else redact(value)
 
 
 def _unique(names: Iterable[str]) -> list[str]:
@@ -195,9 +151,9 @@ def _media(eps: list[EndpointDescriptor], merged: bool) -> dict:
     media: dict[str, Any] = {"schema": _json_schema(schema)}
     if merged:
         keys = _unique(_summary(ep) for ep in eps)
-        media["examples"] = {key: {"value": _redact(ep.body)} for key, ep in zip(keys, eps)}
+        media["examples"] = {key: {"value": redact(ep.body)} for key, ep in zip(keys, eps)}
     else:
-        media["example"] = _redact(eps[0].body)
+        media["example"] = redact(eps[0].body)
     return media
 
 

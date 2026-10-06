@@ -109,7 +109,7 @@ HEX_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
 PLACEHOLDER_RE = re.compile(r"\{([^{}/]+)\}")
 
 
-def _is_sensitive_header(name: str) -> bool:
+def is_sensitive_header(name: str) -> bool:
     low = name.lower()
     if low in STRIP_HEADERS:
         return True
@@ -119,7 +119,7 @@ def _is_sensitive_header(name: str) -> bool:
 
 
 def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
-    return {k: v for k, v in headers.items() if is_replay_header(k) and not _is_sensitive_header(k)}
+    return {k: v for k, v in headers.items() if is_replay_header(k) and not is_sensitive_header(k)}
 
 
 def _sanitize_query(params: dict[str, list[str]]) -> dict[str, str]:

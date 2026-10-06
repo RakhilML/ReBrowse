@@ -1,7 +1,8 @@
-"""Classify whether replaying an endpoint reads or changes something."""
+"""Classify what replaying an endpoint does, and which names hold secrets."""
 
 from __future__ import annotations
 
+import json
 import re
 from enum import Enum
 from typing import Any
@@ -35,6 +36,20 @@ _SESSION_END = re.compile(r"(sign|log)[_\-]?out")
 
 _CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _NON_ALNUM = re.compile(r"[^a-zA-Z0-9]+")
+
+REDACTED = "<redacted>"
+_NAME_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")
+_SECRET_FRAGMENT = re.compile(
+    r"token|secret|passw|passcode|passphrase|pwd|credential|session|sessid|csrf|xsrf|cookie"
+    r"|jwt|bearer|signature|apikey|saml|assertion")
+_SECRET_WORDS = frozenset({
+    "auth", "authn", "authentication", "authorization", "pass", "pw", "otp", "sid", "sig",
+})
+_BENIGN_KEY_QUALIFIERS = frozenset({
+    "sort", "primary", "foreign", "public", "partition", "cache", "idempotency", "row",
+    "group", "lookup", "hot", "composite", "natural", "unique", "map", "dedupe",
+})
+_NOT_KEYS = frozenset({"monkey", "turkey", "donkey", "hockey", "jockey", "whiskey"})
 
 
 def _words(text: str) -> set[str]:
@@ -88,3 +103,44 @@ def classify_effect(method: str, url: str, body: Any = None) -> Effect:
     if method in ("POST", "PUT", "PATCH") or tokens & _WRITE_VERBS or gql == "mutation":
         return Effect.WRITE
     return Effect.READ
+
+
+def _secret_word(word: str, previous: str | None) -> bool:
+    stem = word.removesuffix("s")
+    if stem.endswith("key") and stem not in _NOT_KEYS:
+        return (stem[:-3] or previous) not in _BENIGN_KEY_QUALIFIERS
+    return word in _SECRET_WORDS or bool(_SECRET_FRAGMENT.search(word))
+
+
+def is_secret_name(name: str) -> bool:
+    if _SECRET_FRAGMENT.search(name.lower()):
+        return True
+    words = [w.lower() for w in _NAME_WORD.findall(name)]
+    return any(_secret_word(w, words[i - 1] if i else None) for i, w in enumerate(words))
+
+
+def _redact_json_text(text: str) -> str:
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(parsed, (dict, list)):
+        return text
+    redacted = redact(parsed)
+    return text if redacted == parsed else json.dumps(redacted, separators=(",", ":"))
+
+
+def _named_secret(pair: dict) -> bool:
+    name = pair.get("name")
+    return "value" in pair and isinstance(name, str) and is_secret_name(name)
+
+
+def redact(value: Any) -> Any:
+    if isinstance(value, dict):
+        out = {k: REDACTED if is_secret_name(str(k)) else redact(v) for k, v in value.items()}
+        return {**out, "value": REDACTED} if _named_secret(value) else out
+    if isinstance(value, list):
+        return [redact(v) for v in value]
+    if isinstance(value, str):
+        return _redact_json_text(value)
+    return value
