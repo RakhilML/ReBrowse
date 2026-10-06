@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from rebrowse.models import RawRequest
-from rebrowse.reverse.extractor import _is_api_like, registrable_domain, same_site
+from rebrowse.reverse.extractor import is_api_request, registrable_domain, same_site
 
 
 def _req(url: str, method: str = "GET") -> RawRequest:
@@ -23,7 +23,7 @@ def _req(url: str, method: str = "GET") -> RawRequest:
     "https://api.example.com/api/v1/products",
 ])
 def test_real_apis_survive(url):
-    assert _is_api_like(_req(url)) is True
+    assert is_api_request(_req(url)) is True
 
 
 @pytest.mark.parametrize("url", [
@@ -34,7 +34,7 @@ def test_real_apis_survive(url):
     "https://api.example.com/api/health",
 ])
 def test_telemetry_is_dropped(url):
-    assert _is_api_like(_req(url)) is False
+    assert is_api_request(_req(url)) is False
 
 
 @pytest.mark.parametrize("req_url,page,expected", [
@@ -63,8 +63,14 @@ def test_registrable_domain():
     ("https://x.com/", "https://x.com/", {}),
 ])
 def test_normalize_url(url, template, params):
-    from rebrowse.reverse.extractor import _normalize_url
-    assert _normalize_url(url) == (template, params)
+    from rebrowse.reverse.extractor import normalize_url
+    assert normalize_url(url) == (template, params)
+
+
+@pytest.mark.parametrize("guard", [")]}'\n", ")]}',\n", "for (;;);"])
+def test_parse_body_strips_xssi_guards(guard):
+    from rebrowse.reverse.extractor import parse_body
+    assert parse_body(f'{guard}{{"id": 7}}') == {"id": 7}
 
 
 def test_ip_hosts_compare_whole():

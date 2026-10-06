@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 from rebrowse.models import EndpointDescriptor, HttpMethod, Idempotency, RawRequest, ResponseSchema
 from rebrowse.reverse.graphql import graphql_ops
-from rebrowse.safety import classify_effect
+from rebrowse.safety import classify_effect, split_xssi
 
 # --- Hosts/paths to skip ---
 
@@ -139,7 +139,7 @@ def _looks_like_id(segment: str) -> bool:
     )
 
 
-def _normalize_url(raw_url: str) -> tuple[str, dict[str, str]]:
+def normalize_url(raw_url: str) -> tuple[str, dict[str, str]]:
     parsed = urlparse(raw_url)
     path_params: dict[str, str] = {}
     new_segments: list[str] = []
@@ -296,7 +296,7 @@ _FRAMEWORK_INTERNALS = (
 )
 
 
-def _is_api_like(req: RawRequest) -> bool:
+def is_api_request(req: RawRequest) -> bool:
     """Filter out non-API requests."""
     if req.method not in ALLOWED_METHODS or req.response_status == 0:
         return False
@@ -440,7 +440,7 @@ def extract_endpoints(
     from raw captured requests.
     """
     # Filter
-    api_requests = [r for r in requests if _is_api_like(r)]
+    api_requests = [r for r in requests if is_api_request(r)]
 
     # Domain filter
     if page_domain:
@@ -458,7 +458,7 @@ def extract_endpoints(
 
     samples: dict[str, list[str | None]] = {}
     for r in api_requests:
-        skey = f"{r.method}:{_normalize_url(r.url)[0]}"
+        skey = f"{r.method}:{normalize_url(r.url)[0]}"
         samples.setdefault(skey, []).append(r.response_body)
 
     # Deduplicate by (method, normalized_url)
@@ -466,12 +466,12 @@ def extract_endpoints(
     endpoints: list[EndpointDescriptor] = []
 
     for req, score in scored:
-        url_template, path_params = _normalize_url(req.url)
+        url_template, path_params = normalize_url(req.url)
         method = HttpMethod(req.method) if req.method in HttpMethod.__members__ else HttpMethod.GET
 
         parsed = urlparse(req.url)
         query = _sanitize_query(parse_qs(parsed.query))
-        body = _try_parse_body(req.request_body) if req.request_body else None
+        body = parse_body(req.request_body) if req.request_body else None
         reliability = min(max(score / 10.0, 0.1), 1.0)
         headers = _sanitize_headers(req.request_headers)
         schema = _infer_schema(req.response_body)
@@ -525,14 +525,10 @@ def _make_endpoint(
     )
 
 
-def _try_parse_body(body: str | None):
+def parse_body(body: str | None):
     if not body:
         return None
-    # Strip XSSI prefix
-    for prefix in [")]}'\n", ")]}\n"]:
-        if body.startswith(prefix):
-            body = body[len(prefix):]
-            break
+    body = split_xssi(body)[1]
     try:
         return json.loads(body)
     except (json.JSONDecodeError, TypeError):
