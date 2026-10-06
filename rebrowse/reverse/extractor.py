@@ -1,11 +1,15 @@
 """Reverse-engineer API endpoints from captured network traffic."""
 
 from __future__ import annotations
-import re
-import json
-from urllib.parse import urlparse, parse_qs, urlencode
-from rebrowse.models import RawRequest, EndpointDescriptor, HttpMethod, Idempotency, ResponseSchema
 
+import ipaddress
+import json
+import re
+from urllib.parse import parse_qs, urlparse
+
+from rebrowse.models import EndpointDescriptor, HttpMethod, Idempotency, RawRequest, ResponseSchema
+from rebrowse.reverse.graphql import graphql_ops
+from rebrowse.safety import classify_effect
 
 # --- Hosts/paths to skip ---
 
@@ -79,6 +83,18 @@ SENSITIVE_HEADER_PATTERN = re.compile(
 
 SAFE_HEADERS = {"content-type", "accept", "accept-language", "user-agent", "referer", "origin"}
 
+# Identity and transport headers are never replayed.
+REPLAY_DROP_HEADERS = frozenset({
+    "user-agent", "host", "content-length", "connection", "accept-encoding",
+    "transfer-encoding", "keep-alive", "upgrade", "te", "trailer", "cookie",
+})
+REPLAY_DROP_PREFIXES = ("sec-ch-ua", ":", "proxy-")
+
+
+def is_replay_header(name: str) -> bool:
+    low = name.lower()
+    return low not in REPLAY_DROP_HEADERS and not low.startswith(REPLAY_DROP_PREFIXES)
+
 SENSITIVE_QUERY_PARAMS = {
     "api_key", "apikey", "access_token", "auth_token", "secret",
     "password", "session_id", "client_secret", "private_key", "bearer",
@@ -87,9 +103,9 @@ SENSITIVE_QUERY_PARAMS = {
 FRAMEWORK_QUERY_PARAMS = {"_rsc", "_next", "__next", "_t", "_hash", "__cf_chl_tk"}
 
 # UUID / ID patterns
-UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 NUMERIC_RE = re.compile(r"^\d{2,}$")
-HEX_RE = re.compile(r"^[0-9a-f]{16,}$", re.I)
+HEX_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
 
 
 def _is_sensitive_header(name: str) -> bool:
@@ -102,7 +118,7 @@ def _is_sensitive_header(name: str) -> bool:
 
 
 def _sanitize_headers(headers: dict[str, str]) -> dict[str, str]:
-    return {k: v for k, v in headers.items() if not _is_sensitive_header(k)}
+    return {k: v for k, v in headers.items() if is_replay_header(k) and not _is_sensitive_header(k)}
 
 
 def _sanitize_query(params: dict[str, list[str]]) -> dict[str, str]:
@@ -116,41 +132,32 @@ def _sanitize_query(params: dict[str, list[str]]) -> dict[str, str]:
 
 
 def _looks_like_id(segment: str) -> bool:
-    if UUID_RE.match(segment):
-        return True
-    if NUMERIC_RE.match(segment):
-        return True
-    if HEX_RE.match(segment):
-        return True
-    # Comma-separated list
-    if "," in segment and len(segment.split(",")) >= 3:
-        return True
-    return False
+    return bool(
+        UUID_RE.match(segment) or NUMERIC_RE.match(segment) or HEX_RE.match(segment)
+        or ("," in segment and len(segment.split(",")) >= 3)
+    )
 
 
 def _normalize_url(raw_url: str) -> tuple[str, dict[str, str]]:
-    """Templatize IDs in URL path, return (template, path_params)."""
     parsed = urlparse(raw_url)
-    segments = parsed.path.strip("/").split("/")
     path_params: dict[str, str] = {}
-
-    new_segments = []
-    for seg in segments:
-        if _looks_like_id(seg):
-            param_name = "id"
-            # Try to use previous segment as hint
-            if new_segments:
-                prev = new_segments[-1].strip("{}")
-                if not prev.startswith("{"):
-                    param_name = f"{prev}_id"
-            path_params[param_name] = seg
-            new_segments.append(f"{{{param_name}}}")
-        else:
+    new_segments: list[str] = []
+    for seg in parsed.path.strip("/").split("/"):
+        if not _looks_like_id(seg):
             new_segments.append(seg)
+            continue
+        prev = new_segments[-1] if new_segments else ""
+        base = f"{prev}_id" if prev and not prev.startswith("{") else "id"
+        name, n = base, 2
+        while name in path_params:
+            name, n = f"{base}{n}", n + 1
+        path_params[name] = seg
+        new_segments.append(f"{{{name}}}")
 
-    template_path = "/" + "/".join(new_segments) if new_segments else "/"
-    base = f"{parsed.scheme}://{parsed.netloc}{template_path}"
-    return base, path_params
+    template_path = "/" + "/".join(new_segments)
+    if parsed.path.endswith("/") and template_path != "/":
+        template_path += "/"
+    return f"{parsed.scheme}://{parsed.netloc}{template_path}", path_params
 
 
 def _score_request(req: RawRequest) -> float:
@@ -206,7 +213,7 @@ def _score_request(req: RawRequest) -> float:
         score -= 3.0
 
     # SSO/auth/onboarding — low value for data retrieval
-    if any(h in path for h in ["sso_init", "onboarding", "autoLogin", "auto_login"]):
+    if any(h in path for h in ["sso_init", "onboarding", "autologin", "auto_login"]):
         score -= 3.0
 
     # Bare API root (e.g. /api/v1/ or /api/v2/) with no specific resource
@@ -220,71 +227,91 @@ def _score_request(req: RawRequest) -> float:
     return score
 
 
+# Common multi-part public suffixes (not the full Public Suffix List).
+_MULTI_PART_SUFFIXES = frozenset({
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "net.uk", "sch.uk",
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+    "co.jp", "or.jp", "ne.jp", "go.jp", "ac.jp",
+    "co.in", "net.in", "org.in", "gen.in", "firm.in", "ind.in",
+    "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz",
+    "co.za", "org.za", "web.za",
+    "com.br", "net.br", "org.br", "gov.br",
+    "com.cn", "net.cn", "org.cn", "gov.cn",
+    "com.mx", "com.tr", "com.sg", "com.hk", "com.tw", "com.ar", "com.sa", "com.ua",
+    "co.kr", "or.kr", "co.id", "co.th", "com.my", "com.ph", "com.vn", "co.il",
+})
+
+
+def registrable_domain(host: str) -> str:
+    host = host.lower().strip().split(":")[0].strip(".")
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+    if ".".join(parts[-2:]) in _MULTI_PART_SUFFIXES:
+        return ".".join(parts[-3:])
+    return ".".join(parts[-2:])
+
+
+def same_site(url: str, page_domain: str) -> bool:
+    host = urlparse(url).hostname or ""
+    page = page_domain.lower().split(":")[0]
+    return bool(host and page) and registrable_domain(host) == registrable_domain(page)
+
+
+def _host_matches_pattern(host: str, pattern: str) -> bool:
+    p = pattern.rstrip(".")
+    if not p:
+        return False
+    return host == p or host.startswith(p + ".") or ("." + p + ".") in ("." + host + ".")
+
+
+def _path_has_run(path_lower: str, needle: str) -> bool:
+    needle_segs = [s for s in needle.lower().split("/") if s]
+    if not needle_segs:
+        return False
+    segs = [s for s in path_lower.split("/") if s]
+    n = len(needle_segs)
+    return any(segs[i:i + n] == needle_segs for i in range(len(segs) - n + 1))
+
+
+def is_telemetry_path(path: str) -> bool:
+    path_lower = path.lower()
+    return any(_path_has_run(path_lower, t) for t in SKIP_TELEMETRY_PATHS)
+
+
+_FRAMEWORK_INTERNALS = (
+    "_next/static", "_next/data", "static/chunks", "static/media",
+    "cdn-cgi", "__webpack", "__vite", "/assets/", "/static/", "/_/js/", "/_/ss/",
+)
+
+
 def _is_api_like(req: RawRequest) -> bool:
     """Filter out non-API requests."""
-    if req.method not in ALLOWED_METHODS:
+    if req.method not in ALLOWED_METHODS or req.response_status == 0:
         return False
 
     parsed = urlparse(req.url)
-    host = parsed.netloc.lower()
-
-    # Skip known bad hosts
-    if host in SKIP_HOSTS:
+    host = (parsed.hostname or "").lower()
+    if host in SKIP_HOSTS or any(_host_matches_pattern(host, p) for p in SKIP_HOST_PATTERNS):
         return False
 
-    # Skip hosts matching telemetry/ads patterns
-    if any(pat in host for pat in SKIP_HOST_PATTERNS):
-        return False
-
-    # Skip static files
     path_lower = parsed.path.lower()
-    if any(path_lower.endswith(ext) for ext in SKIP_EXTENSIONS):
+    if path_lower.endswith(tuple(SKIP_EXTENSIONS)):
+        return False
+    if any(seg in path_lower for seg in _FRAMEWORK_INTERNALS):
+        return False
+    if is_telemetry_path(path_lower):
         return False
 
-    # Skip framework internals
-    if any(seg in path_lower for seg in [
-        "_next/static", "_next/data", "static/chunks", "static/media",
-        "cdn-cgi", "__webpack", "__vite",
-        "/assets/", "/static/", "/_/js/", "/_/ss/",
-    ]):
-        return False
-
-    # Skip telemetry paths
-    for tpath in SKIP_TELEMETRY_PATHS:
-        if tpath in path_lower:
-            return False
-
-    # Skip bare homepage (GET / with no query) — it's just HTML, not an API
-    if req.method == "GET" and parsed.path in ("", "/") and not parsed.query:
-        content_type = req.response_headers.get("content-type", "")
-        if "html" in content_type:
-            return False
-
-    # Must have a successful-ish response
-    if req.response_status == 0:
-        return False
-
-    return True
-
-
-def _is_same_domain(req_url: str, page_domain: str) -> bool:
-    """Check if request is from the same registrable domain as the page."""
-    req_host = urlparse(req_url).netloc.lower()
-    page = page_domain.lower()
-
-    if req_host == page:
-        return True
-    # Allow api.example.com for example.com
-    if req_host.endswith(f".{page}") or page.endswith(f".{req_host}"):
-        return True
-    # Allow subdomains sharing the same base
-    req_parts = req_host.rsplit(".", 2)
-    page_parts = page.rsplit(".", 2)
-    if len(req_parts) >= 2 and len(page_parts) >= 2:
-        if req_parts[-2:] == page_parts[-2:]:
-            return True
-
-    return False
+    return not (
+        req.method == "GET" and parsed.path in ("", "/") and not parsed.query
+        and "html" in req.response_headers.get("content-type", "")
+    )
 
 
 def _infer_schema(body: str | None) -> ResponseSchema | None:
@@ -330,6 +357,65 @@ def _schema_from_value(val, depth: int = 0) -> ResponseSchema:
         return ResponseSchema(type="null", inferred_from_samples=1)
 
 
+def _scalar_type(val) -> str:
+    if isinstance(val, bool):
+        return "boolean"
+    if isinstance(val, int):
+        return "integer"
+    if isinstance(val, float):
+        return "number"
+    if isinstance(val, str):
+        return "string"
+    if val is None:
+        return "null"
+    return "unknown"
+
+
+def _schema_from_values(values: list, depth: int = 0) -> ResponseSchema:
+    values = [v for v in values if v is not None]
+    n = len(values)
+    if depth > 4 or not values:
+        return ResponseSchema(type="unknown", inferred_from_samples=max(n, 1))
+
+    if all(isinstance(v, dict) for v in values):
+        keys: list[str] = []
+        for v in values:
+            for k in v:
+                if k not in keys:
+                    keys.append(k)
+                if len(keys) >= 30:
+                    break
+        props = {}
+        required = []
+        for k in keys:
+            props[k] = _schema_from_values([v[k] for v in values if k in v], depth + 1).model_dump()
+            if all(k in v for v in values):
+                required.append(k)
+        return ResponseSchema(type="object", properties=props, required=required, inferred_from_samples=n)
+
+    if all(isinstance(v, list) for v in values):
+        items_vals = [item for v in values for item in v]
+        items = _schema_from_values(items_vals, depth + 1).model_dump() if items_vals else None
+        return ResponseSchema(type="array", items=items, inferred_from_samples=n)
+
+    types = {_scalar_type(v) for v in values}
+    return ResponseSchema(type=types.pop() if len(types) == 1 else "unknown", inferred_from_samples=n)
+
+
+def _merge_schemas(bodies: list[str | None]) -> ResponseSchema | None:
+    values = []
+    for b in bodies:
+        if not b:
+            continue
+        try:
+            values.append(json.loads(b))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    if not values:
+        return None
+    return _schema_from_values(values)
+
+
 def _lookslike_ad_response(body: str | None) -> bool:
     if not body:
         return False
@@ -352,7 +438,7 @@ def extract_endpoints(
 
     # Domain filter
     if page_domain:
-        api_requests = [r for r in api_requests if _is_same_domain(r.url, page_domain)]
+        api_requests = [r for r in api_requests if same_site(r.url, page_domain)]
 
     # Ad filter
     api_requests = [r for r in api_requests if not _lookslike_ad_response(r.response_body)]
@@ -364,48 +450,73 @@ def extract_endpoints(
     # Filter low-scoring
     scored = [(r, s) for r, s in scored if s > 0]
 
+    samples: dict[str, list[str | None]] = {}
+    for r in api_requests:
+        skey = f"{r.method}:{_normalize_url(r.url)[0]}"
+        samples.setdefault(skey, []).append(r.response_body)
+
     # Deduplicate by (method, normalized_url)
     seen: set[str] = set()
     endpoints: list[EndpointDescriptor] = []
 
     for req, score in scored:
         url_template, path_params = _normalize_url(req.url)
+        method = HttpMethod(req.method) if req.method in HttpMethod.__members__ else HttpMethod.GET
+
+        parsed = urlparse(req.url)
+        query = _sanitize_query(parse_qs(parsed.query))
+        body = _try_parse_body(req.request_body) if req.request_body else None
+        reliability = min(max(score / 10.0, 0.1), 1.0)
+        headers = _sanitize_headers(req.request_headers)
+        schema = _infer_schema(req.response_body)
+
+        ops = graphql_ops(body, query)
+        if ops:
+            for op in ops:
+                dedup_key = f"{req.method}:{url_template}:{op.dedup_token()}"
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                op_body = op.body if op.body is not None else {"operationName": op.name}
+                eff = classify_effect(method.value, url_template, op_body)
+                endpoints.append(_make_endpoint(
+                    method, url_template, headers, query, path_params, op_body,
+                    reliability, schema, req.url, eff, description=op.label(),
+                ))
+            continue
+
         dedup_key = f"{req.method}:{url_template}"
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
-
-        method = HttpMethod(req.method) if req.method in HttpMethod.__members__ else HttpMethod.GET
-        idempotency = Idempotency.SAFE if method == HttpMethod.GET else Idempotency.UNSAFE
-
-        parsed = urlparse(req.url)
-        query = _sanitize_query(parse_qs(parsed.query))
-
-        endpoints.append(EndpointDescriptor(
-            method=method,
-            url_template=url_template,
-            headers_template=_sanitize_headers(req.request_headers),
-            query=query,
-            path_params=path_params,
-            body=_try_parse_body(req.request_body) if req.request_body else None,
-            idempotency=idempotency,
-            reliability_score=min(max(score / 10.0, 0.1), 1.0),
-            response_schema=_infer_schema(req.response_body),
-            trigger_url=req.url,
+        eff = classify_effect(method.value, url_template, body)
+        merged_schema = _merge_schemas(samples.get(dedup_key, [req.response_body]))
+        endpoints.append(_make_endpoint(
+            method, url_template, headers, query, path_params, body,
+            reliability, merged_schema, req.url, eff,
         ))
 
     return endpoints
 
 
-def extract_auth_headers(requests: list[RawRequest]) -> dict[str, str]:
-    """Extract auth-related headers from captured requests."""
-    auth_headers: dict[str, str] = {}
-    for req in requests:
-        for k, v in req.request_headers.items():
-            low = k.lower()
-            if low in ("authorization", "x-csrf-token", "x-xsrf-token", "x-api-key"):
-                auth_headers[k] = v
-    return auth_headers
+def _make_endpoint(
+    method, url_template, headers, query, path_params, body,
+    reliability, schema, trigger_url, effect, description=None,
+) -> EndpointDescriptor:
+    return EndpointDescriptor(
+        method=method,
+        url_template=url_template,
+        description=description,
+        headers_template=headers,
+        query=query,
+        path_params=path_params,
+        body=body,
+        idempotency=Idempotency.SAFE if effect.value == "read" else Idempotency.UNSAFE,
+        reliability_score=reliability,
+        response_schema=schema,
+        trigger_url=trigger_url,
+        effect=effect,
+    )
 
 
 def _try_parse_body(body: str | None):
@@ -422,10 +533,7 @@ def _try_parse_body(body: str | None):
         pass
     # Try form-urlencoded
     try:
-        from urllib.parse import parse_qs as pqs
-        parsed = pqs(body)
-        if parsed:
-            return {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
-    except Exception:
-        pass
-    return None
+        parsed = parse_qs(body)
+    except ValueError:
+        return None
+    return {k: v[0] if len(v) == 1 else v for k, v in parsed.items()} or None
