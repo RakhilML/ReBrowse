@@ -77,6 +77,9 @@ def graphql_ops(body: Any, query_params: dict | None = None) -> list[GraphQLOp]:
     if isinstance(query_params, dict):
         name = query_params.get("operationName")
         name = name if isinstance(name, str) and name else None
+        query = query_params.get("query")
+        query = query if isinstance(query, str) and query.strip() else None
+        kind = graphql_kind_of_query(query) if query else None
         pq = None
         ext = query_params.get("extensions")
         if isinstance(ext, str):
@@ -84,9 +87,9 @@ def graphql_ops(body: Any, query_params: dict | None = None) -> list[GraphQLOp]:
                 persisted = (json.loads(ext).get("persistedQuery") or {})
                 if isinstance(persisted.get("sha256Hash"), str):
                     pq = persisted["sha256Hash"]
-            except (json.JSONDecodeError, AttributeError, TypeError):
+            except (ValueError, AttributeError, TypeError, RecursionError):
                 pq = None
-        if name or pq:
-            ops.append(GraphQLOp(name=name, kind=None, body=None, hash=pq))
+        if name or pq or kind:
+            ops.append(GraphQLOp(name=name, kind=kind, body=None, query=query, hash=pq))
 
     return ops
