@@ -54,6 +54,12 @@ class _Handler(BaseHTTPRequestHandler):
     def _json(self, code: int, payload: dict):
         self._send(code, "application/json", json.dumps(payload).encode())
 
+    def _redirect(self, location: str):
+        self.send_response(302)
+        self.send_header("location", location)
+        self.send_header("content-length", "0")
+        self.end_headers()
+
     def do_GET(self):
         path = urlparse(self.path).path
         HITS[("GET", path)] += 1
@@ -75,6 +81,13 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, {"results": [{"id": 1, "title": "match"}]})
         if path == "/blocked":
             return self._send(403, "text/html", CHALLENGE)
+        if path == "/moved":
+            return self._redirect("/api/items")
+        if path == "/sso":
+            return self._redirect(f"http://localhost:{self.server.server_address[1]}/login")
+        if path == "/login":
+            seen = "|".join(self.headers.get(h) or "-" for h in ("authorization", "x-api-key", "cookie"))
+            return self._send(200, "text/html", f"<form>sign in</form><!--{seen}-->".encode())
         if path == "/big":
             return self._send(200, "text/html", b"<p>" + b"x" * 50_000 + b"</p>")
         if path == "/api/fail":

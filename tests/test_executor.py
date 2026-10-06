@@ -98,6 +98,23 @@ async def test_credentials_go_only_to_their_host(fixture_site):
     assert headers == {} and query == {}
 
 
+async def test_off_site_redirect_gets_no_credentials_and_is_not_success(fixture_site):
+    store_api_key("127.0.0.1", "secret-key", auth_type="header")
+    store_cookies("127.0.0.1", [{"name": "sid", "value": "s1", "domain": "127.0.0.1"}])
+    ep = EndpointDescriptor(method=HttpMethod.GET, url_template=f"{fixture_site}/sso")
+
+    trace = await execute_endpoint(_skill(), ep)
+
+    assert trace.result.endswith("<!---|-|--->")
+    assert not trace.success and trace.error.startswith("auth_required:")
+
+
+async def test_same_site_redirect_to_json_still_succeeds(fixture_site):
+    ep = EndpointDescriptor(method=HttpMethod.GET, url_template=f"{fixture_site}/moved")
+    trace = await execute_endpoint(_skill(), ep)
+    assert trace.success and len(trace.result["items"]) == 3
+
+
 async def test_query_api_key(fixture_site):
     store_api_key("127.0.0.1", "k123", auth_type="query")
     ep = EndpointDescriptor(method=HttpMethod.GET, url_template=f"{fixture_site}/api/echo")

@@ -98,6 +98,22 @@ async def _pace(host: str) -> None:
         await asyncio.sleep(wait)
 
 
+def _strip_off_site(origin: str):
+    async def hook(request: httpx.Request) -> None:
+        if not same_site(str(request.url), origin):
+            for name in ("authorization", "cookie", "x-api-key"):
+                request.headers.pop(name, None)
+    return hook
+
+
+def _sign_in_redirect(resp: httpx.Response, endpoint: EndpointDescriptor, origin: str) -> str | None:
+    if not resp.history or "html" not in resp.headers.get("content-type", ""):
+        return None
+    if same_site(str(resp.url), origin) and endpoint.response_schema is None:
+        return None
+    return f"auth_required: redirected to an HTML page on {resp.url.host}; sign-in is likely needed"
+
+
 def blocked_reason(resp: httpx.Response) -> str | None:
     if resp.status_code not in (401, 403, 429, 503):
         return None
@@ -148,7 +164,8 @@ async def execute_endpoint(
     # A write that timed out may already have applied, so only reads are retried.
     retries = MAX_RETRIES if eff is Effect.READ else 0
 
-    async with net.client(TIMEOUT_S, follow_redirects=True) as client:
+    hooks = {"request": [_strip_off_site(host)]}
+    async with net.client(TIMEOUT_S, follow_redirects=True, event_hooks=hooks) as client:
         for attempt in range(retries + 1):
             await _pace(host)
             try:
@@ -170,10 +187,10 @@ async def execute_endpoint(
                 continue
 
             trace.result, trace.truncated = _parse_result(resp)
-            blocked = blocked_reason(resp)
-            trace.success = blocked is None and 200 <= resp.status_code < 400
-            if blocked:
-                trace.error = blocked
+            refused = blocked_reason(resp) or _sign_in_redirect(resp, endpoint, host)
+            trace.success = refused is None and 200 <= resp.status_code < 400
+            if refused:
+                trace.error = refused
             elif not trace.success:
                 trace.error = f"HTTP {resp.status_code}"
             else:
