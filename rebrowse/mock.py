@@ -92,21 +92,21 @@ def _path_of(target: str) -> str:
         return target.partition("?")[0]
 
 
-def _servable(req: RawRequest, domain: str) -> bool:
+def _servable(req: RawRequest, domain: str, redirects: bool) -> bool:
     status = req.response_status
-    return (status >= 200 and not 300 <= status < 400
+    return (status >= 200 and (redirects or not 300 <= status < 400)
             and same_site(req.url, domain) and is_api_request(req))
 
 
-def build_routes(capture: CaptureResult) -> list[Route]:
+def build_routes(capture: CaptureResult, redirects: bool = False) -> list[Route]:
     routes: dict[tuple[str, str, str, tuple[str, ...]], Route] = {}
     for index, req in enumerate(capture.requests):
-        if not _servable(req, capture.domain):
+        if not _servable(req, capture.domain, redirects):
             continue
         content_type = _header_value(req.response_headers.get("content-type", ""))
         try:
             text = req.response_body or ""
-            payload = redact_body(text, content_type).encode("utf-8")
+            payload = redact_body(text, content_type).encode("utf-8", errors="replace")
             body = parse_body(req.request_body)
         except RecursionError:
             continue

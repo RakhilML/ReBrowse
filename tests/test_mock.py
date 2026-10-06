@@ -761,3 +761,10 @@ def test_cli_finds_busy_ports_and_lists_saved_captures(no_serving):
     assert taken.exit_code == 1 and "already in use" in json.loads(taken.stdout)["error"]
     assert "(saved: ex.com)" in json.loads(unknown.stdout)["error"]
     assert runner.invoke(main, ["mock", "EX.com", "-p", "0"]).exit_code == 0
+
+
+def test_a_lone_surrogate_is_served_as_a_replacement_character():
+    with _serving(_site(_raw("GET", "/api/names", '{"name": "\ud800"}'))) as client:
+        names = client.get("/api/names")
+
+    assert names.json() == {"name": "?"}
