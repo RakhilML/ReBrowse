@@ -1,6 +1,7 @@
 """DSPy signatures for rebrowse LLM calls."""
 
 from __future__ import annotations
+
 import dspy
 
 
@@ -22,18 +23,3 @@ class PickEndpoint(dspy.Signature):
     params: dict = dspy.OutputField(desc="Path parameter values to substitute (empty dict if none)")
     query: dict = dspy.OutputField(desc="Query parameter values (empty dict if none)")
     reason: str = dspy.OutputField(desc="One-line explanation of why this endpoint was picked")
-
-
-class DescribeEndpoint(dspy.Signature):
-    """Write a concise one-line description for an API endpoint."""
-
-    method: str = dspy.InputField(desc="HTTP method (GET, POST, etc.)")
-    url_template: str = dspy.InputField(desc="URL template of the endpoint")
-    description: str = dspy.OutputField(desc="One-line description of what this endpoint does")
-
-
-class DescribeEndpoints(dspy.Signature):
-    """Write concise descriptions for a batch of API endpoints discovered from network traffic."""
-
-    endpoints_json: str = dspy.InputField(desc="JSON array of endpoints with url_template and method")
-    descriptions_json: str = dspy.OutputField(desc="JSON array of objects with url_template, method, description")
