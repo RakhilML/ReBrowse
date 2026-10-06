@@ -1,11 +1,15 @@
 """Pydantic models for skills, endpoints, and execution traces."""
 
 from __future__ import annotations
-from datetime import datetime, timezone
+
+from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Optional
-from pydantic import BaseModel, Field
+from typing import Any
 from uuid import uuid4
+
+from pydantic import BaseModel, Field
+
+from rebrowse.safety import Effect, classify_effect
 
 
 def _id() -> str:
@@ -13,7 +17,7 @@ def _id() -> str:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 # --- Enums ---
@@ -47,9 +51,9 @@ class VerificationStatus(str, Enum):
 
 class ResponseSchema(BaseModel):
     type: str = "object"
-    properties: Optional[dict[str, Any]] = None
-    items: Optional[Any] = None
-    required: Optional[list[str]] = None
+    properties: dict[str, Any] | None = None
+    items: Any | None = None
+    required: list[str] | None = None
     inferred_from_samples: int = 0
 
 
@@ -57,20 +61,29 @@ class EndpointDescriptor(BaseModel):
     endpoint_id: str = Field(default_factory=_id)
     method: HttpMethod = HttpMethod.GET
     url_template: str
-    description: Optional[str] = None
+    description: str | None = None
     headers_template: dict[str, str] = Field(default_factory=dict)
     query: dict[str, Any] = Field(default_factory=dict)
     path_params: dict[str, str] = Field(default_factory=dict)
-    body: Optional[Any] = None
+    body: Any | None = None
     idempotency: Idempotency = Idempotency.SAFE
     verification_status: VerificationStatus = VerificationStatus.UNVERIFIED
     reliability_score: float = 0.5
-    response_schema: Optional[ResponseSchema] = None
-    trigger_url: Optional[str] = None
-    dom_extraction: bool = False
+    response_schema: ResponseSchema | None = None
+    trigger_url: str | None = None
+    effect: Effect | None = None
+
+    def get_effect(self) -> Effect:
+        if self.effect is not None:
+            return self.effect
+        return classify_effect(self.method.value, self.url_template, self.body)
+
+
+SKILL_SCHEMA_VERSION = 2
 
 
 class SkillManifest(BaseModel):
+    schema_version: int = 1  # records saved before versioning
     skill_id: str = Field(default_factory=_id)
     name: str
     domain: str
@@ -88,10 +101,10 @@ class RawRequest(BaseModel):
     url: str
     method: str
     request_headers: dict[str, str] = Field(default_factory=dict)
-    request_body: Optional[str] = None
+    request_body: str | None = None
     response_status: int = 0
     response_headers: dict[str, str] = Field(default_factory=dict)
-    response_body: Optional[str] = None
+    response_body: str | None = None
     timestamp: str = Field(default_factory=_now)
 
 
@@ -100,7 +113,7 @@ class CaptureResult(BaseModel):
     domain: str
     final_url: str
     cookies: list[dict[str, Any]] = Field(default_factory=list)
-    html: Optional[str] = None
+    html: str | None = None
     js_bundles: dict[str, str] = Field(default_factory=dict)
 
 
@@ -111,16 +124,9 @@ class ExecutionTrace(BaseModel):
     skill_id: str
     endpoint_id: str
     started_at: str = Field(default_factory=_now)
-    completed_at: Optional[str] = None
+    completed_at: str | None = None
     success: bool = False
-    status_code: Optional[int] = None
-    error: Optional[str] = None
-    result: Optional[Any] = None
-
-
-class OrchestratorResult(BaseModel):
-    result: Any = None
-    source: str = "live-capture"  # "store" | "live-capture" | "dom-fallback"
-    skill: Optional[SkillManifest] = None
-    trace: Optional[ExecutionTrace] = None
-    timing_ms: float = 0.0
+    status_code: int | None = None
+    error: str | None = None
+    result: Any | None = None
+    truncated: bool = False
