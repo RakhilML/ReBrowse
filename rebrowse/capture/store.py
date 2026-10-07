@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import os
 import re
 import time
 from pathlib import Path
@@ -29,6 +30,17 @@ def save_capture(capture: CaptureResult, path: str | Path | None = None) -> Path
     payload = capture.model_copy(update={"html": None, "cookies": []})
     Path(path).write_text(payload.model_dump_json(), encoding="utf-8")
     return Path(path)
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    """Replace PATH in one step, leaving no partial file behind on failure."""
+    partial = path.with_name(f".{path.name}.tmp")
+    try:
+        partial.write_bytes(data)
+        os.replace(partial, path)
+    except OSError:
+        partial.unlink(missing_ok=True)
+        raise
 
 
 def load_capture(path: str | Path) -> CaptureResult:

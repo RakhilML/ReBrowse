@@ -8,16 +8,28 @@ import re
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from rebrowse import config
 from rebrowse.models import CaptureResult, RawRequest
 from rebrowse.reverse.extractor import is_replay_header, is_sensitive_header, registrable_domain
-from rebrowse.safety import FORM, is_secret_name, redact, redact_pairs
+from rebrowse.safety import FORM, REDACTED, is_secret_name, redact, redact_pairs
 
 _CREDENTIAL_VALUE = re.compile(
     r"(bearer|basic|token|digest|negotiate|ntlm|hmac)\s|eyJ[\w-]+\.[\w-]+\.", re.IGNORECASE)
+_TOKEN_VALUE = re.compile(r"bearer\s|eyJ[\w-]+\.[\w-]+\.", re.IGNORECASE)
 _JSONP_PARAMS = frozenset({"callback", "jsonp", "cb"})
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_NOT_SENT = frozenset({
+    "origin", "referer", "content-encoding",
+    "if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "if-range",
+    "x-http-method-override", "x-http-method", "x-method-override",
+    "traceparent", "tracestate", "baggage", "sentry-trace", "b3", "newrelic", "uber-trace-id",
+    "x-request-id", "x-correlation-id", "x-amzn-trace-id", "x-cloud-trace-context",
+    "request-id", "request-context", "elastic-apm-traceparent",
+})
+_NOT_SENT_PREFIXES = ("x-b3-", "x-datadog-", "uberctx-")
+_CACHE_BUSTER = re.compile(r"_=[0-9]+")
 
 
 class HarError(ValueError):
@@ -48,6 +60,10 @@ def _clean_segment(segment: str) -> str:
     return ";".join([head, *(p for p in params if not is_secret_name(p.partition("=")[0]))])
 
 
+def _without_cache_buster(query: str) -> str:
+    return "&".join(part for part in query.split("&") if not _CACHE_BUSTER.fullmatch(part))
+
+
 def clean_url(url: str) -> str | None:
     url = url.partition("#")[0]
     try:
@@ -58,7 +74,7 @@ def clean_url(url: str) -> str | None:
         return None
     netloc = parts.netloc.rpartition("@")[2]
     path = "/".join(_clean_segment(s) for s in parts.path.split("/"))
-    query = redact_pairs(parts.query)
+    query = redact_pairs(_without_cache_buster(parts.query))
     if (netloc, path, query) == (parts.netloc, parts.path, parts.query):
         return url
     return urlunsplit(parts._replace(netloc=netloc, path=path, query=query))
@@ -94,6 +110,48 @@ def replayable_header(name: str) -> bool:
 
 def credential_value(value: str) -> bool:
     return bool(_CREDENTIAL_VALUE.match(value.strip()))
+
+
+def credential_in_path(url: str) -> bool:
+    for segment in urlsplit(url).path.split("/"):
+        head, *params = unquote(segment).split(";")
+        if credential_value(head) or any(credential_value(p.partition("=")[2]) for p in params):
+            return True
+    return False
+
+
+def _token_value(value: str) -> bool:
+    return bool(_TOKEN_VALUE.match(value.strip()))
+
+
+def scrub_url(url: str) -> str | None:
+    """clean_url, with token-valued query values redacted; None for a credential in the path."""
+    clean = clean_url(url)
+    if clean is None or credential_in_path(clean):
+        return None
+    parts = urlsplit(clean)
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    if not any(_token_value(value) for _, value in pairs):
+        return clean
+    query = urlencode([(name, REDACTED if _token_value(value) else value) for name, value in pairs])
+    return urlunsplit(parts._replace(query=query))
+
+
+def content_type_of(headers: dict[str, str]) -> str:
+    return next((value for name, value in headers.items() if name.lower() == "content-type"), "")
+
+
+def _sendable(name: str, value: str) -> bool:
+    low = name.lower()
+    return (bool(_HEADER_NAME.fullmatch(name)) and value.isascii() and value.isprintable()
+            and replayable_header(name) and low not in _NOT_SENT
+            and not low.startswith(_NOT_SENT_PREFIXES) and not credential_value(value))
+
+
+def sendable_headers(recorded: dict[str, str]) -> dict[str, str]:
+    """The recorded headers a replay may send, without credentials or browser context."""
+    stripped = {name: value.strip() for name, value in recorded.items()}
+    return {name: value for name, value in stripped.items() if _sendable(name, value)}
 
 
 def _request_headers(request: dict) -> dict[str, str]:

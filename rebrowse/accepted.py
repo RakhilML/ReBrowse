@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
 from rebrowse.capture.har import read_json
+from rebrowse.capture.store import write_atomic
 from rebrowse.drift import BREAKING
 
 ACCEPTED = "accepted"
@@ -128,6 +128,4 @@ def update_accepted(
 def write_accepted(path: Path, entries: list[dict]) -> None:
     """Write UTF-8 JSON; a lone surrogate (only possible inside a string) becomes its \\u escape."""
     text = json.dumps(entries, indent=2, ensure_ascii=False) + "\n"
-    partial = path.with_name(f".{path.name}.tmp")
-    partial.write_bytes(text.encode("utf-8", errors="backslashreplace"))
-    os.replace(partial, path)
+    write_atomic(path, text.encode("utf-8", errors="backslashreplace"))
