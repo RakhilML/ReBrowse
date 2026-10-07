@@ -16,6 +16,8 @@ import click
 from rebrowse.config import ensure_dirs
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from rebrowse.models import CaptureResult
 
 if sys.platform == "win32":
@@ -215,20 +217,87 @@ def _side(path: Path, capture: CaptureResult, facts: dict) -> dict:
             "bodies": bodies}
 
 
+def _accepted_options(command: Callable) -> Callable:
+    command = click.option(
+        "--update-accepted", is_flag=True,
+        help="Rewrite the --accepted FILE from this run: keep entries that still match or "
+             "that it could not check, drop stale ones, add the breaking changes it does not "
+             "accept yet.")(command)
+    return click.option(
+        "--accepted", type=click.Path(dir_okay=False, path_type=Path), default=None,
+        metavar="FILE",
+        help='JSON list of reviewed breaking changes; matching ones are reported as '
+             '"accepted" and do not fail the run.')(command)
+
+
+def _accepted_entries(file: Path | None, update: bool) -> list[dict] | None:
+    """Load the --accepted FILE; raises ValueError when it is invalid."""
+    from rebrowse.accepted import load_accepted
+
+    if file is None:
+        if update:
+            raise click.UsageError("--update-accepted needs --accepted FILE")
+        return None
+    return load_accepted(file, missing_ok=update)
+
+
+def _count(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def _settle_accepted(command: str, report: dict, file: Path | None,
+                     entries: list[dict] | None, update: bool, uncompared: set[str]) -> None:
+    """Mark the changes FILE accepts and recount breaking, rewriting FILE first on update."""
+    from rebrowse.accepted import (
+        ACCEPTED,
+        apply_accepted,
+        unsettled,
+        update_accepted,
+        write_accepted,
+    )
+    from rebrowse.drift import BREAKING
+
+    if file is None or entries is None:
+        return
+    changes = report.pop("changes")
+    failed = {change["route"] for change in changes if unsettled(change)}
+    if update and failed:
+        click.echo(f"[{command}] not updating {file}: {_count(len(failed), 'route', 'routes')} "
+                   "failed to replay or answered with a server error", err=True)
+    elif update:
+        entries = update_accepted(changes, entries, uncompared)
+        try:
+            write_accepted(file, entries)
+        except OSError as e:
+            _emit({"error": f"Could not write {file}: {e}"}, error_code=2)
+            return
+    changes, stale, unchecked = apply_accepted(changes, entries, uncompared)
+    report.update(breaking=sum(change["severity"] == BREAKING for change in changes),
+                  accepted=sum(change["severity"] == ACCEPTED for change in changes),
+                  stale=stale, unchecked=unchecked, changes=changes)
+    if stale:
+        hint = "" if update else " or rerun with --update-accepted"
+        click.echo(f"[{command}] {_count(len(stale), 'entry', 'entries')} in {file} matched no "
+                   f"breaking change; remove stale entries{hint}", err=True)
+
+
 @main.command(short_help="Report API changes between two recordings.")
 @click.argument("base")
 @click.argument("head")
 @click.option("--domain", "-d", "domains", multiple=True, metavar="HOST[:PORT]",
               help="Site to compare in HAR files; give it twice for BASE then HEAD "
                    "(default: host of each one's first HTML page).")
-def diff(base: str, head: str, domains: tuple[str, ...]):
+@_accepted_options
+def diff(base: str, head: str, domains: tuple[str, ...], accepted: Path | None,
+         update_accepted: bool):
     """Report the API changes from BASE to HEAD that can break their client.
 
     Each is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
     capture is used. Nothing is sent over the network, and the report holds routes,
     statuses, media types, field paths and JSON types, never a response value (object keys
-    that read like names do appear, as field names). Exits 1 when a change is breaking and
-    2 when an input cannot be read or holds no API traffic.
+    that read like names do appear, as field names). Breaking changes listed in the
+    --accepted FILE are reported as accepted. Exits 1 when a change is breaking and not
+    accepted, and 2 when an input or FILE cannot be read or an input holds no API traffic.
     """
     from rebrowse.drift import BREAKING, compare_facts, route_facts
 
@@ -236,6 +305,7 @@ def diff(base: str, head: str, domains: tuple[str, ...]):
         raise click.BadParameter("give it at most twice", param_hint="--domain")
     base_domain, head_domain = (domains * 2)[:2] if domains else (None, None)
     try:
+        entries = _accepted_entries(accepted, update_accepted)
         base_path, base_capture = _traffic(base, base_domain)
         head_path, head_capture = _traffic(head, head_domain)
     except ValueError as e:
@@ -248,14 +318,18 @@ def diff(base: str, head: str, domains: tuple[str, ...]):
             _emit({"error": f"No API traffic for {capture.domain} in {path}"}, error_code=2)
             return
     changes = compare_facts(before, after)
-    breaking = sum(change["severity"] == BREAKING for change in changes)
-    _emit({
+    report = {
         "base": _side(base_path, base_capture, before),
         "head": _side(head_path, head_capture, after),
-        "breaking": breaking,
+        "breaking": sum(change["severity"] == BREAKING for change in changes),
         "changes": changes,
-    })
-    sys.exit(1 if breaking else 0)
+    }
+    if accepted:
+        either = before | after
+        one_sided = {either[key].route.name for key in before.keys() ^ after.keys()}
+        _settle_accepted("diff", report, accepted, entries, update_accepted, one_sided)
+    _emit(report)
+    sys.exit(1 if report["breaking"] else 0)
 
 
 @main.command(short_help="Replay recorded reads against a server.")
@@ -264,7 +338,9 @@ def diff(base: str, head: str, domains: tuple[str, ...]):
               help="Server to test, as scheme://host[:port].")
 @click.option("--domain", "-d", default=None, metavar="HOST[:PORT]",
               help="Site to test in a HAR (default: host of the first HTML page).")
-def contract(source: str, against: str, domain: str | None):
+@_accepted_options
+def contract(source: str, against: str, domain: str | None, accepted: Path | None,
+             update_accepted: bool):
     """Replay the reads recorded in SOURCE against ORIGIN and report what breaks the client.
 
     SOURCE is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
@@ -272,16 +348,19 @@ def contract(source: str, against: str, domain: str | None):
     retries or following redirects; calls to sibling hosts are skipped. Secret-named values
     are redacted, recorded credentials and cookies are never sent, and the only credential
     is an API key stored with 'auth set' for ORIGIN's host. Answers are judged as diff
-    judges them. Exits 1 when a change is breaking or a replay failed, and 2 on bad input,
-    no reads to replay, or when ORIGIN never answered.
+    judges them, and breaking changes listed in the --accepted FILE are reported as
+    accepted; a failed replay cannot be accepted. Exits 1 when a change is breaking and not
+    accepted or a replay failed, and 2 on bad input or FILE, no reads to replay, or when
+    ORIGIN never answered.
     """
-    from rebrowse.contract import parse_target, run_contract
+    from rebrowse.contract import BLOCKED, NO_RESPONSE, parse_target, run_contract
 
     try:
         target = parse_target(against)
     except ValueError as e:
         raise click.BadParameter(str(e), param_hint="--against")
     try:
+        entries = _accepted_entries(accepted, update_accepted)
         path, capture = _traffic(source, domain)
     except ValueError as e:
         _emit({"error": str(e)}, error_code=2)
@@ -290,7 +369,12 @@ def contract(source: str, against: str, domain: str | None):
     if "error" in report:
         _emit(report, error_code=2)
         return
-    _emit({"source": str(path.resolve()), **report})
+    report = {"source": str(path.resolve()), **report}
+    uncompared = {row["route"] for row in report["skipped"]} | {
+        change["route"] for change in report["changes"]
+        if change["kind"] in (NO_RESPONSE, BLOCKED)}
+    _settle_accepted("contract", report, accepted, entries, update_accepted, uncompared)
+    _emit(report)
     sys.exit(1 if report["breaking"] else 0)
 
 

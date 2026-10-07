@@ -47,6 +47,7 @@ rebrowse openapi news.ycombinator.com -o api.json  # OpenAPI 3.1 export (stdout 
 rebrowse mock e2e.har [-p 8787]                    # serve the recorded API on 127.0.0.1
 rebrowse diff baseline.har e2e.har                 # API changes that break the client
 rebrowse contract e2e.har --against http://localhost:8000  # replay reads against a server
+rebrowse diff baseline.har e2e.har --accepted diff-accepted.json  # reviewed breaks pass
 rebrowse skills [-q "search"]  |  rebrowse show <id>  |  rebrowse delete <id>
 rebrowse auth set api.github.com ghp_xxx [--type bearer|header|query]
 rebrowse mcp                                       # MCP server over stdio
@@ -328,6 +329,72 @@ field paths and JSON type names, plus transport error text, never a recorded or 
 {"severity": "breaking", "kind": "no_response", "route": "GET /api/summary",
  "error": "ReadTimeout: timed out", "failed": 1}
 ```
+
+## Accepted changes
+
+Some breaking changes are intended, such as a backend pull request that renames `$.total`
+while the frontend change ships alongside it. `--accepted FILE` on `diff` and `contract` reads
+a committed JSON list of the breaking changes a team has reviewed. A change that matches an
+entry keeps its place in `changes` with `"severity": "accepted"` (and the entry's `reason`)
+and no longer counts toward `breaking` or the exit code; any other break still fails the run.
+
+```bash
+# on the pull request: accept this run's breaks, add a reason to each entry, commit the file
+rebrowse contract baseline.har --against http://localhost:8000 \
+  --accepted contract-accepted.json --update-accepted
+# CI reads it and never rewrites it
+rebrowse contract baseline.har --against http://api:8000 --accepted contract-accepted.json
+```
+
+```json
+[
+  {"kind": "field_removed", "route": "GET /api/orders/{orders_id}", "field": "$.total",
+   "base": ["integer"], "head": null, "reason": "renamed to totalCents in #412"},
+  {"kind": "field_type", "route": "GET /api/users/{users_id}"}
+]
+```
+
+- **Entries.** `kind` (`status`, `content_type`, `body_empty`, `field_removed`,
+  `field_optional` or `field_type`) and `route` are required; `field`, `base`, `head` and
+  `reason` are optional. `severity` is ignored, so a change copied from a report works as it
+  is. Any other key is an error, which catches typos such as `feild`.
+- **Matching.** `kind` and `route` must be equal, and so must each of `field`, `base` and
+  `head` that the entry gives. Leaving out `field` accepts every field change of that kind on
+  the route; leaving out `base` and `head` accepts the change whatever the new statuses or
+  types are. Only breaking changes are matched.
+- **What cannot be accepted.** Replay failures (`no_response`, `blocked`) are not API changes:
+  a timeout or a challenge page must never turn into a pass, and neither can a status change
+  to a server error (`"head": [503]`), which is an outage answered as JSON. A broad `status`
+  entry accepts 3xx and 4xx changes (a removed endpoint, a 410, a new sign-in redirect) but
+  never a 5xx. A `field` on `status`, `content_type` or `body_empty` is an error too, since
+  those change the whole route. Info changes, such as
+  `route_added`, `route_missing` or an added field, never fail a run and need no entry. An
+  entry of any of these kinds makes the file invalid.
+- **Stale entries.** An entry that matched no breaking change on a route the run compared,
+  or that names a route the run never saw, is listed under `stale` and counted in a warning
+  on stderr, so the file cannot rot into a blanket ignore list. It usually means the
+  recording caught up, for example after main's baseline was re-recorded: delete the entry,
+  or rerun with `--update-accepted`.
+- **Unchecked entries.** An entry on a route the run saw but could not compare is listed
+  under `unchecked` instead, never as stale: a route only one recording has in `diff`, or one
+  that `contract` skipped (a write, a sibling host, ...) or failed to replay.
+- **`--update-accepted`.** Rewrites FILE from the run, creating it if needed: entries that
+  still match are kept as written, reasons included, and so are unchecked ones; stale ones
+  are dropped; each breaking change that no entry matches is appended as its `kind`,
+  `route`, `field`, `base` and `head`. The file holds route names, field paths, statuses,
+  media types and JSON type names, never a recorded value, and a rerun writes the same
+  bytes. A run that exits 2 never writes it, and a run in which a route failed to replay or
+  answered with a 5xx leaves it untouched, so a server that is still starting or partly
+  down cannot rewrite the
+  reviewed file.
+- **One file per check.** Give `diff` and `contract`, and each baseline, a file of its own.
+  A run judges only the routes it compares, so an entry another check needs can be stale
+  here, and `--update-accepted` would drop it.
+
+With `--accepted`, the report also holds `accepted` (how many changes were accepted),
+`stale` and `unchecked` (the entries), and `breaking` counts the unaccepted ones only. Exit
+codes keep their meaning. An invalid file, or a missing one without `--update-accepted`,
+exits 2 before `contract` sends a request.
 
 ## Safety model
 
