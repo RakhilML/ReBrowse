@@ -15,7 +15,12 @@ from rebrowse.capture.store import save_capture
 from rebrowse.execution.executor import execute_endpoint
 from rebrowse.llm.client import LLMError, describe_endpoints, parse_intent, pick_endpoint
 from rebrowse.models import CaptureResult, EndpointDescriptor, SkillManifest, VerificationStatus
-from rebrowse.reverse.extractor import canonical_template, extract_endpoints, is_telemetry_path
+from rebrowse.reverse.extractor import (
+    canonical_template,
+    endpoint_key,
+    extract_endpoints,
+    is_telemetry_path,
+)
 from rebrowse.reverse.scanner import is_third_party_bundle, scan_bundles_for_routes
 from rebrowse.safety import Effect, classify_effect
 from rebrowse.selection import usable_endpoints
@@ -66,42 +71,98 @@ def _bundle_endpoints(capture, known: set[tuple[str, str]]) -> list[EndpointDesc
     return out
 
 
-async def _describe(endpoints: list[EndpointDescriptor], tag: str) -> None:
+def _bundle_description(ep: EndpointDescriptor) -> str:
+    return f"JS bundle route: {urlparse(ep.url_template).path}"
+
+
+def _inherit(ep: EndpointDescriptor, old: EndpointDescriptor) -> None:
+    ep.endpoint_id = old.endpoint_id
+    if not ep.description and old.description != _bundle_description(old):
+        ep.description = old.description
+    tested = old.verification_status is not VerificationStatus.UNVERIFIED
+    same_source = (old.trigger_url is None) == (ep.trigger_url is None)
+    if tested and same_source and old.get_effect() == ep.get_effect():
+        ep.verification_status = old.verification_status
+        ep.reliability_score = old.reliability_score
+
+
+def _carry_forward(
+    endpoints: list[EndpointDescriptor], previous: list[EndpointDescriptor],
+) -> tuple[dict[str, EndpointDescriptor], list[EndpointDescriptor]]:
+    unused = [(endpoint_key(old), old) for old in previous]
+    matched: dict[str, EndpointDescriptor] = {}
+    for ep in endpoints:
+        key = endpoint_key(ep)
+        match = next((i for i, (old_key, _) in enumerate(unused) if old_key == key), None)
+        if match is not None:
+            old = unused.pop(match)[1]
+            _inherit(ep, old)
+            matched[ep.endpoint_id] = old
+    return matched, [old for _, old in unused]
+
+
+async def _describe(endpoints: list[EndpointDescriptor], tag: str) -> int:
     pending = [ep for ep in endpoints if not ep.description][:MAX_DESCRIBE]
     if not pending:
-        return
+        return 0
     try:
         descriptions = await describe_endpoints(
             [{"url_template": ep.url_template, "method": ep.method.value} for ep in pending]
         )
     except LLMError as e:
         _log(f"[{tag}] LLM description failed: {e}")
-        return
+        return 0
     by_key = {
         (d.get("method", "").upper(), d.get("url_template", "")): d.get("description", "")
         for d in descriptions if isinstance(d, dict)
     }
+    described = 0
     for ep in pending:
         text = by_key.get((ep.method.value, ep.url_template)) or by_key.get(("", ep.url_template))
         if text:
             ep.description = text
+            described += 1
+    return described
+
+
+def _endpoint_row(ep: EndpointDescriptor) -> dict:
+    return {
+        "id": ep.endpoint_id,
+        "method": ep.method.value,
+        "url": ep.url_template,
+        "effect": ep.get_effect().value,
+        "description": ep.description or "(no description)",
+    }
 
 
 async def _learn(capture: CaptureResult, intent_signature: str, tag: str) -> dict:
     endpoints = extract_endpoints(capture.requests, page_domain=capture.domain)
     known = {(ep.method.value, canonical_template(ep.url_template)) for ep in endpoints}
     endpoints += _bundle_endpoints(capture, known)
-    _log(f"[{tag}] {len(endpoints)} endpoints")
     if not endpoints:
+        _log(f"[{tag}] 0 endpoints")
         return {
             "error": f"No API endpoints found on {capture.domain}",
             "requests_captured": len(capture.requests),
         }
 
-    await _describe(endpoints, tag)
+    existing = find_exact_domain(capture.domain)
+    previous = existing.endpoints if existing else []
+    matched, dropped = _carry_forward(endpoints, previous)
+    kept = len(matched)
+    effects = [
+        {"id": ep.endpoint_id, "from": old.get_effect().value, "to": ep.get_effect().value}
+        for ep in endpoints
+        if (old := matched.get(ep.endpoint_id)) and old.get_effect() != ep.get_effect()
+    ]
+    changed = f", {len(effects)} changed effect" if effects else ""
+    _log(f"[{tag}] {len(endpoints)} endpoints: {len(endpoints) - kept} added, {kept} kept, "
+         f"{len(dropped)} dropped{changed}")
+
+    described = await _describe(endpoints, tag)
     for ep in endpoints:
         if not ep.description and ep.trigger_url is None:
-            ep.description = f"JS bundle route: {urlparse(ep.url_template).path}"
+            ep.description = _bundle_description(ep)
 
     skill = SkillManifest(
         name=f"{capture.domain} API",
@@ -110,7 +171,6 @@ async def _learn(capture: CaptureResult, intent_signature: str, tag: str) -> dic
         intent_signature=intent_signature,
         endpoints=endpoints,
     )
-    existing = find_exact_domain(capture.domain)
     if existing:
         skill.skill_id = existing.skill_id
         skill.created_at = existing.created_at
@@ -125,16 +185,18 @@ async def _learn(capture: CaptureResult, intent_signature: str, tag: str) -> dic
         "name": skill.name,
         "replaced": bool(existing),
         "endpoints_count": len(endpoints),
+        "changes": {
+            "added": len(endpoints) - kept,
+            "kept": kept,
+            "dropped": len(dropped),
+            "described": described,
+        },
         "endpoints": [
-            {
-                "id": ep.endpoint_id,
-                "method": ep.method.value,
-                "url": ep.url_template,
-                "effect": ep.get_effect().value,
-                "description": ep.description or "(no description)",
-            }
+            {**_endpoint_row(ep), "change": "kept" if ep.endpoint_id in matched else "added"}
             for ep in endpoints
         ],
+        "dropped": [_endpoint_row(ep) for ep in dropped],
+        "effect_changes": effects,
     }
 
 

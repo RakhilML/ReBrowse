@@ -73,6 +73,7 @@ async def test_build_extracts_traffic_and_bundle_routes(built, isolated):
     assert not any(path.startswith("api/collect") for _, path in eps)
     assert ("GET", "") not in eps
     assert all(e["description"].startswith("stub:") for e in built["endpoints"])
+    assert {e["change"] for e in built["endpoints"]} == {"added"}
 
     assert list((isolated / "captures").glob("*.json"))
     assert any(c["name"] == "sid" for c in get_cookies(built["domain"]))
@@ -95,6 +96,8 @@ async def test_rebuild_replaces_instead_of_duplicating(built, fixture_site):
     assert again["replaced"] is True
     assert again["skill_id"] == built["skill_id"]
     assert len(list_all_skills()) == 1
+    assert {e["id"] for e in built["endpoints"]} <= {e["id"] for e in again["endpoints"]}
+    assert again["changes"]["added"] == 0
 
 
 async def test_run_executes_a_read(built, llm):
