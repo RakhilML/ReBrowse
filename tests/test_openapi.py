@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from urllib.parse import urlencode
@@ -147,7 +148,7 @@ def test_graphql_operations_merge_into_one_post():
 
 
 def test_secrets_are_redacted_and_trigger_urls_dropped():
-    search = _get("https://ex.com/api/search?session_token=abc&q=cats", {"results": []})
+    search = _get("https://ex.com/api/search?session_token=sess-xyz&q=cats", {"results": []})
     spec = _export_traffic([
         _post("https://ex.com/api/login",
               {"username": "a", "password": "hunter2", "meta": {"api_token": "tok-xyz"}}),
@@ -155,7 +156,7 @@ def test_secrets_are_redacted_and_trigger_urls_dropped():
     ])
     text = json.dumps(spec)
 
-    for secret in ("hunter2", "tok-xyz", "abc", search.url):
+    for secret in ("hunter2", "tok-xyz", "sess-xyz", search.url):
         assert secret not in text
     login = spec["paths"]["/api/login"]["post"]["requestBody"]["content"]["application/json"]
     assert login["schema"]["properties"]["password"] == {"type": "string"}
@@ -340,8 +341,8 @@ def test_browser_transport_and_credential_headers_are_not_parameters():
     browser = {"User-Agent": "ua", "Host": "h", "Content-Length": "3", "Origin": "o", "Referer": "r",
                "Accept-Language": "en", "Cache-Control": "no-cache", "Pragma": "no-cache",
                "Priority": "u=1", "DNT": "1", "sec-ch-ua": '"x"', "Sec-Fetch-Site": "same-origin"}
-    credentials = {"X-CSRF-Token": "c1", "X-XSRF-TOKEN": "c2", "X-API-Key": "c3",
-                   "Proxy-Authorization": "c4", "Set-Cookie": "c5"}
+    credentials = {"X-CSRF-Token": "cred-1", "X-XSRF-TOKEN": "cred-2", "X-API-Key": "cred-3",
+                   "Proxy-Authorization": "cred-4", "Set-Cookie": "cred-5"}
     ep = EndpointDescriptor(url_template="https://ex.com/api/v", headers_template={
         **browser, **credentials, "X-Client-Version": "2.1"})
 
@@ -365,6 +366,30 @@ def test_regenerated_endpoint_ids_do_not_change_the_export():
 
     assert_valid(first)
     assert json.dumps(first) == json.dumps(again)
+
+
+def test_version_is_a_hash_of_the_document_not_of_save_times():
+    endpoints = extract_endpoints([
+        _get("https://ex.com/api/users/101", {"id": 101}),
+        _post("https://ex.com/graphql", {"operationName": "A", "query": "query A { a }"}),
+    ], page_domain="ex.com")
+    skill = _skill(endpoints)
+    resaved = skill.model_copy(update={
+        "created_at": "2031-01-01T00:00:00+00:00", "updated_at": "2031-01-02T00:00:00+00:00",
+        "endpoints": [ep.model_copy(update={"endpoint_id": f"new{i}"})
+                      for i, ep in enumerate(endpoints)]})
+
+    spec = skill_to_openapi(skill)
+
+    assert json.dumps(spec) == json.dumps(skill_to_openapi(resaved))
+    info = spec["info"]
+    assert list(info) == ["title", "version", "description", "x-rebrowse-skill-id"]
+    assert re.fullmatch(r"[0-9a-f]{12}", info["version"])
+    unversioned = {**spec, "info": {k: v for k, v in info.items() if k != "version"}}
+    canonical = json.dumps(unversioned, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    assert info["version"] == hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    renamed = [endpoints[0].model_copy(update={"description": "a user"}), *endpoints[1:]]
+    assert skill_to_openapi(_skill(renamed))["info"]["version"] != info["version"]
 
 
 def test_only_json_and_form_bodies_get_schemas_and_examples():

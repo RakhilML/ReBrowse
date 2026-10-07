@@ -66,7 +66,19 @@ Commands print JSON to stdout (progress goes to stderr) and exit non-zero on err
 - Scans first-party JS bundles for routes, taking the method from the call site
   (`axios.post(...)` → POST) and turning template literals into placeholders.
 - Infers response schemas across every sample (fields seen in all samples are required).
-- Rebuilding a site replaces its skill rather than adding a duplicate.
+- Rebuilding a site updates its skill rather than adding a duplicate. An endpoint seen again
+  (same method, URL template and GraphQL operation) keeps its id, its description and its
+  `verify` result. The result is reset when the endpoint's effect changed, for example a read
+  that now classifies as a write, or when it moved between observed traffic and a route found
+  only in a JS bundle. The LLM only describes endpoints that have no description
+  yet, at most 25 per run, so a large app gets the rest on later runs, and an LLM outage
+  leaves existing descriptions alone. Request templates, examples and response schemas always
+  come from the new recording. Endpoints the new recording did not see are dropped. The JSON
+  output reports `changes` (`added`, `kept`, `dropped`, `described`),
+  marks each endpoint `added` or `kept`, lists the `dropped` ones with their old ids, and
+  lists kept endpoints whose effect changed (`effect_changes`, such as a read that became a
+  write). To get fresh descriptions, `rebrowse delete` the skill and build again; that also
+  resets ids and `verify` results.
 
 **run** — the LLM extracts the domain and intent, the skill is found by domain alias or
 semantic search (matches below 0.25 similarity are refused, not guessed), and the LLM
@@ -88,9 +100,18 @@ operation. The export runs offline, never includes cookies or auth headers, and 
 values whose names look secret (`password`, `passwd`, `token`, `csrf`, `session`, `api_key`,
 ...), also inside JSON-encoded query values such as GraphQL `variables`. Request bodies get a
 schema and example only when they are JSON or form-encoded; multipart and XML bodies are
-listed by media type alone, and GET operations never document a body. Two exports of an
-unchanged API are not identical (descriptions come from the LLM and `info.version` is the
-save time), so to see what changed, compare the recordings:
+listed by media type alone, and GET operations never document a body. `info.version` is the
+first 12 hex digits of a SHA-256 of the rest of the document, not a save time, so it
+changes exactly when the document does. Re-learning a recording that carries the same
+requests and values gives a byte-identical file, because kept endpoints keep their
+descriptions, which makes a committed `api.json` diff read as an API change log. This holds
+within one data directory: a fresh `~/.rebrowse` creates a new skill, with a new
+`x-rebrowse-skill-id` and new LLM descriptions, so in CI cache and restore
+`$REBROWSE_DATA_DIR/skills.db` between runs, and only that file. It holds no secrets, while
+`vault/` keeps stored API keys and cookies next to the key that decrypts them and `captures/`
+keeps raw traffic; never cache either, since pull-request workflows can restore a cache.
+Values that differ per session, such as a per-request id header or feed ids, still show up
+as example changes. To check whether a change breaks the client, compare the recordings:
 `rebrowse diff baseline.har e2e.har` (see [Drift report](#drift-report)).
 
 ## Import from HAR
@@ -121,7 +142,9 @@ rebrowse never imports cookies from a HAR, and `auth set` only holds a bearer to
 `X-API-Key` or an `api_key` query value, so an app that signs in with a session cookie can be
 documented but not replayed. `verify` reports such reads as failed: a 401, or `auth_required`
 when the request is redirected to an HTML sign-in page. Importing the same site again, or
-after a `build`, replaces its skill and keeps its id. In CI, compare the e2e run's HAR with
+after a `build`, updates its skill and keeps its id. Endpoints seen before keep their ids,
+descriptions and `verify` results, and only endpoints without a description are sent to
+the LLM; the output reports what was `added`, `kept` and `dropped`. In CI, compare the e2e run's HAR with
 the one recorded on the main branch, which fails the job on a change that breaks the client
 (see [Drift report](#drift-report)):
 

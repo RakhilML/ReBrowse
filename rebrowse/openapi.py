@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from collections import Counter
 from collections.abc import Iterable
@@ -77,7 +79,7 @@ def _json_schema(schema: dict) -> dict:
     if schema.get("items") is not None:
         out["items"] = _json_schema(schema["items"])
     if schema.get("required"):
-        out["required"] = list(schema["required"])
+        out["required"] = sorted(schema["required"])
     return out
 
 
@@ -233,6 +235,11 @@ def _path_keys(endpoints: list[EndpointDescriptor]) -> dict[str, str]:
     return keys
 
 
+def _content_hash(document: dict) -> str:
+    text = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
 def skill_to_openapi(skill: SkillManifest) -> dict:
     path_keys = _path_keys(skill.endpoints)
     groups: dict[tuple[str, str], list[EndpointDescriptor]] = {}
@@ -249,14 +256,13 @@ def skill_to_openapi(skill: SkillManifest) -> dict:
         paths.setdefault(path, {})[method] = {
             "operationId": operation_id, **_operation(path, method, group, primary)}
 
-    return {
+    info = {"title": skill.name, "description": skill.description,
+            "x-rebrowse-skill-id": skill.skill_id}
+    document = {
         "openapi": "3.1.0",
-        "info": {
-            "title": skill.name,
-            "version": skill.updated_at,
-            "description": skill.description,
-            "x-rebrowse-skill-id": skill.skill_id,
-        },
+        "info": info,
         "servers": [{"url": primary}] if primary else [],
         "paths": paths,
     }
+    version = _content_hash(document)
+    return {**document, "info": {"title": skill.name, "version": version, **info}}
