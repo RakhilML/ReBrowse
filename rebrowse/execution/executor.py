@@ -77,8 +77,11 @@ def _apply_credentials(skill: SkillManifest, url: str, headers: dict, query: dic
             headers["Cookie"] = cookie
 
     key = get_api_key(host) or (get_api_key(skill.domain) if first_party else None)
-    if not key:
-        return
+    if key:
+        add_api_key(key, headers, query)
+
+
+def add_api_key(key: dict, headers: dict, query: dict) -> None:
     if key.get("auth_type") == "header":
         headers["X-API-Key"] = key["key"]
     elif key.get("auth_type") == "query":
@@ -87,7 +90,7 @@ def _apply_credentials(skill: SkillManifest, url: str, headers: dict, query: dic
         headers["Authorization"] = f"Bearer {key['key']}"
 
 
-async def _pace(host: str) -> None:
+async def pace(host: str) -> None:
     interval = config.HOST_MIN_INTERVAL_S
     if interval <= 0:
         return
@@ -167,7 +170,7 @@ async def execute_endpoint(
     hooks = {"request": [_strip_off_site(host)]}
     async with net.client(TIMEOUT_S, follow_redirects=True, event_hooks=hooks) as client:
         for attempt in range(retries + 1):
-            await _pace(host)
+            await pace(host)
             try:
                 resp = await client.request(
                     endpoint.method.value, url, headers=headers, params=query, **body)

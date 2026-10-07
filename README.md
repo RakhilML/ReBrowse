@@ -46,6 +46,7 @@ rebrowse verify news.ycombinator.com               # health-check a skill's read
 rebrowse openapi news.ycombinator.com -o api.json  # OpenAPI 3.1 export (stdout without -o)
 rebrowse mock e2e.har [-p 8787]                    # serve the recorded API on 127.0.0.1
 rebrowse diff baseline.har e2e.har                 # API changes that break the client
+rebrowse contract e2e.har --against http://localhost:8000  # replay reads against a server
 rebrowse skills [-q "search"]  |  rebrowse show <id>  |  rebrowse delete <id>
 rebrowse auth set api.github.com ghp_xxx [--type bearer|header|query]
 rebrowse mcp                                       # MCP server over stdio
@@ -253,6 +254,79 @@ types, field paths and JSON type names, never a response value:
 ```json
 {"severity": "breaking", "kind": "field_type", "route": "GET /api/orders/{orders_id}",
  "field": "$.total", "base": ["string"], "head": ["null", "string"]}
+```
+
+## Contract tests
+
+`rebrowse contract SOURCE --against ORIGIN` answers the question a backend pull request asks:
+does the changed backend still answer the calls the frontend makes? It replays the reads
+recorded in SOURCE against ORIGIN and judges the live answers with the rules of `diff`, so the
+frontend's own traffic is the contract: no hand-written consumer contracts, browser, LLM or
+skill, and nothing is stored. SOURCE is read as `mock` reads it, and ORIGIN is
+`scheme://host[:port]` with no path.
+
+```bash
+# frontend, once: record the e2e run with browser.new_context(record_har_path="baseline.har")
+# and commit the HAR next to the backend. Backend CI, on every pull request:
+docker compose up -d --wait api && ./scripts/seed-fixtures.sh   # the data the recording saw
+REBROWSE_HOST_INTERVAL=0 rebrowse contract baseline.har --against http://api:8000
+# exit 0: compatible, 1: breaking change or failed replay, 2: bad input or no answer at all
+```
+
+- **What is sent.** Only calls classified as reads: GETs, and GraphQL queries POSTed with
+  their query text. A GraphQL document that defines a mutation anywhere counts as a mutation,
+  and a query parameter such as `action`, `cmd`, `op` or `_method` with a write or delete verb
+  (`/ajax.php?action=delete`) makes the call a write. Writes, destructive calls, routes
+  recorded only as 304, event streams, and calls with a credential-like path segment (a JWT)
+  are listed under `skipped` with the reason, and never sent; there is no `--yes`. Each route gets at most three
+  distinct recorded requests, one at a time, in recorded order, with no retries and no
+  redirects followed, so a route that now redirects to `/login` is compared as a 302.
+  Recorded calls to sibling hosts, such as `api.app.com` next to `app.com`, are skipped;
+  `--domain api.app.com` picks the host under test, in a HAR or in a saved capture of
+  `www.app.com`. Requests to a host other than localhost are paced like `verify`
+  (`REBROWSE_HOST_INTERVAL=0` turns that off for a CI service name such as `api`). Every
+  replay has one overall deadline and reads at most the size limit, so a stream or a huge
+  export cannot hang the run.
+- **What is not sent.** The URL is ORIGIN plus the recorded path and query, with secret-named
+  path parameters such as `;jsessionid=` removed, secret-named query values redacted and the
+  fragment dropped. Cookies, `Authorization`, API-key, CSRF and session headers, headers whose
+  value looks like a credential, `Origin`, `Referer` and the conditional headers
+  (`If-None-Match`, `If-Modified-Since`, ...) and method overrides (`X-HTTP-Method-Override`)
+  are dropped, as are headers that are not valid
+  HTTP as recorded (a non-token name, a value with control or non-ASCII characters), and the
+  User-Agent is rebrowse's own. Bodies of non-GET reads are redacted like the query. The only
+  credential that can be attached is an API key stored with `rebrowse auth set` for ORIGIN's
+  own host; cookies are never sent, and keys stored for the recorded site never go to ORIGIN.
+  A recording that cannot be sent at all, such as a URL over 64 KB, gives way to the next one,
+  and a route left with none is skipped as `unreplayable`.
+- **Judging.** Recorded and live answers of the same requests are compared route by route
+  with the breaking rules of [`diff`](#drift-report) (`status`, `content_type`, `body_empty`,
+  `field_removed`, `field_optional`, `field_type`). Each request is also judged on its own: one
+  recorded with a 2xx or 304 that now answers with a redirect, a client error or a server
+  error, or one recorded with any status below 500 that now answers with a 5xx, is a breaking
+  `status` change for its route, even when other requests to that route still answer. A replay that gets no answer, such as a timeout or a refused connection, is a
+  breaking `no_response`, and so is any replayed route whose answer is no longer an API
+  response, such as a JSON route at `/` answered with an HTML page. A
+  challenge page is a breaking `blocked`, never data. A failed replay is left out of the
+  comparison, so its route is reported once, by the failure. When ORIGIN answers none of the
+  requests, the run exits 2, which tells "the server did not start" apart from "the API
+  broke".
+- **Caveats.** The recorded ids must exist on ORIGIN: seed it with the fixtures the recording
+  was made against, otherwise `/api/orders/1001` answers 404 and is reported as a breaking
+  status change. A field counts as required when every replayed recording carries it, so an
+  optional field that ORIGIN leaves out for differently seeded data is reported as removed.
+  Only reads are ever replayed, so changes to writes go untested. Secret-named values are
+  sent redacted, so a call that needs one (`pageToken`, a `sessionId` variable) usually
+  answers 400 and is reported as broken.
+
+The report is JSON on stdout: the source, domain and target; how many routes were replayed,
+how many requests were sent and answered; the skipped routes; the number of breaking changes;
+and the changes ordered by route. Like `diff`, it holds route names, statuses, media types,
+field paths and JSON type names, plus transport error text, never a recorded or live value:
+
+```json
+{"severity": "breaking", "kind": "no_response", "route": "GET /api/summary",
+ "error": "ReadTimeout: timed out", "failed": 1}
 ```
 
 ## Safety model

@@ -44,6 +44,7 @@ def main():
       openapi <target>  export a skill as an OpenAPI 3.1 document
       mock <source>     serve recorded API responses on localhost
       diff <a> <b>      report API changes between two recordings
+      contract <source> replay recorded reads against a server, report breaking changes
       mcp               serve skills to agents over MCP (stdio)
     """
     ensure_dirs()
@@ -255,6 +256,42 @@ def diff(base: str, head: str, domains: tuple[str, ...]):
         "changes": changes,
     })
     sys.exit(1 if breaking else 0)
+
+
+@main.command(short_help="Replay recorded reads against a server.")
+@click.argument("source")
+@click.option("--against", required=True, metavar="ORIGIN",
+              help="Server to test, as scheme://host[:port].")
+@click.option("--domain", "-d", default=None, metavar="HOST[:PORT]",
+              help="Site to test in a HAR (default: host of the first HTML page).")
+def contract(source: str, against: str, domain: str | None):
+    """Replay the reads recorded in SOURCE against ORIGIN and report what breaks the client.
+
+    SOURCE is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
+    capture is used. Only reads are sent, at most three per route, one at a time, without
+    retries or following redirects; calls to sibling hosts are skipped. Secret-named values
+    are redacted, recorded credentials and cookies are never sent, and the only credential
+    is an API key stored with 'auth set' for ORIGIN's host. Answers are judged as diff
+    judges them. Exits 1 when a change is breaking or a replay failed, and 2 on bad input,
+    no reads to replay, or when ORIGIN never answered.
+    """
+    from rebrowse.contract import parse_target, run_contract
+
+    try:
+        target = parse_target(against)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="--against")
+    try:
+        path, capture = _traffic(source, domain)
+    except ValueError as e:
+        _emit({"error": str(e)}, error_code=2)
+        return
+    report = asyncio.run(run_contract(capture, target))
+    if "error" in report:
+        _emit(report, error_code=2)
+        return
+    _emit({"source": str(path.resolve()), **report})
+    sys.exit(1 if report["breaking"] else 0)
 
 
 @main.command()

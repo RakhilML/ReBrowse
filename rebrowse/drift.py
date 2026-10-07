@@ -164,7 +164,7 @@ def _answers(statuses: set[int]) -> bool:
     return any(200 <= status < 300 or status == 304 for status in statuses)
 
 
-def _breaks(before: set[int], after: set[int]) -> bool:
+def status_breaks(before: set[int], after: set[int]) -> bool:
     if not _answers(before):
         return False
     return not _answers(after) or any(status >= 500 for status in after - before)
@@ -173,7 +173,7 @@ def _breaks(before: set[int], after: set[int]) -> bool:
 def _compare_route(before: Facts, after: Facts) -> Iterator[dict]:
     name = before.route.name
     statuses = sorted(before.statuses), sorted(after.statuses)
-    if _breaks(before.statuses, after.statuses):
+    if status_breaks(before.statuses, after.statuses):
         yield _change(BREAKING, "status", name, *statuses)
     elif before.statuses != after.statuses:
         yield _change(INFO, "status", name, *statuses)

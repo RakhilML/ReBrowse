@@ -48,7 +48,7 @@ def _clean_segment(segment: str) -> str:
     return ";".join([head, *(p for p in params if not is_secret_name(p.partition("=")[0]))])
 
 
-def _clean_url(url: str) -> str | None:
+def clean_url(url: str) -> str | None:
     url = url.partition("#")[0]
     try:
         parts = urlsplit(url)
@@ -72,7 +72,7 @@ def _exchanges(entries: list) -> Iterator[tuple[str, dict, dict]]:
         url, method, status = request.get("url"), request.get("method"), response.get("status")
         if not (isinstance(url, str) and isinstance(method, str) and isinstance(status, int)):
             continue
-        if status > 0 and (clean := _clean_url(url)):
+        if status > 0 and (clean := clean_url(url)):
             yield clean, request, response
 
 
@@ -88,14 +88,18 @@ def _headers(raw: Any, keep: Callable[[str], bool]) -> dict[str, str]:
     return out
 
 
-def _replayable(name: str) -> bool:
+def replayable_header(name: str) -> bool:
     return is_replay_header(name) and not is_sensitive_header(name) and not is_secret_name(name)
 
 
+def credential_value(value: str) -> bool:
+    return bool(_CREDENTIAL_VALUE.match(value.strip()))
+
+
 def _request_headers(request: dict) -> dict[str, str]:
-    headers = {k: v for k, v in _headers(request.get("headers"), _replayable).items()
-               if not _CREDENTIAL_VALUE.match(v.strip())}
-    referer = _clean_url(headers.pop("referer", ""))
+    headers = {k: v for k, v in _headers(request.get("headers"), replayable_header).items()
+               if not credential_value(v)}
+    referer = clean_url(headers.pop("referer", ""))
     return {**headers, "referer": referer} if referer else headers
 
 
