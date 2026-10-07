@@ -26,6 +26,19 @@ def test_classify_effect(method, url, body, expected):
     assert classify_effect(method, url, body) == expected
 
 
+@pytest.mark.parametrize("url,body,expected", [
+    ("https://x.com/ajax.php?action=delete&id=5", None, Effect.DESTRUCTIVE),
+    ("https://x.com/index.php?_method=PUT", None, Effect.WRITE),
+    ("https://x.com/ajax.php?action=list&q=delete", None, Effect.READ),
+    ("https://x.com/graphql", {"operationName": "Feed",
+                               "query": "query Feed { a }\nmutation Save { b }"}, Effect.WRITE),
+    ("https://x.com/graphql", {"query": "query { audit { mutationCount } }"}, Effect.READ),
+])
+def test_query_actions_and_mixed_graphql_documents(url, body, expected):
+    method = "POST" if body else "GET"
+    assert classify_effect(method, url, body) == expected
+
+
 def test_word_boundary_no_false_positive():
     assert classify_effect("GET", "https://x.com/v1/soundtracks", None) == Effect.READ
 

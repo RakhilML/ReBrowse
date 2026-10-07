@@ -54,6 +54,8 @@ _XSSI_GUARDS = (")]}',", ")]}'", ")]}", "while(1);", "for(;;);", "for (;;);")
 _JSONP = re.compile(r"(\s*(?:/\*\*/)?\s*[\w$.]+\s*\(\s*)(.*?)(\s*\)\s*;?\s*)", re.DOTALL)
 _CAS_TICKETS = ("ST-", "PT-")
 FORM = "application/x-www-form-urlencoded"
+_MUTATION_DEFINITION = re.compile(r"(?:^|[\s},])mutation\b")
+_ACTION_KEYS = frozenset({"action", "cmd", "command", "op", "do", "task", "method", "_method"})
 
 
 def _words(text: str) -> set[str]:
@@ -63,7 +65,7 @@ def _words(text: str) -> set[str]:
 def graphql_kind_of_query(query: str) -> str | None:
     stripped = query.lstrip()
     low = stripped.lower()
-    if low.startswith("mutation"):
+    if low.startswith("mutation") or _MUTATION_DEFINITION.search(stripped):
         return "mutation"
     if low.startswith(("query", "subscription")) or stripped.startswith("{"):
         return "query"
@@ -90,10 +92,16 @@ def _has_destructive_mutation(body: Any) -> bool:
     return bool(_words(text) & _DESTRUCTIVE_VERBS)
 
 
+def _action_words(url: str) -> set[str]:
+    query = urlsplit(url).query if "//" in url else ""
+    return {word for key, value in parse_qsl(query) if key.lower() in _ACTION_KEYS
+            for word in _words(value)}
+
+
 def classify_effect(method: str, url: str, body: Any = None) -> Effect:
     method = (method or "GET").upper()
     path = urlsplit(url).path if "//" in url else url
-    tokens = _words(path)
+    tokens = _words(path) | _action_words(url)
     gql = _graphql_kind(body)
 
     if method == "DELETE" or tokens & _DESTRUCTIVE_VERBS:
