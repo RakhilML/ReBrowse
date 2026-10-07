@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from rebrowse import config
 from rebrowse.capture.har import har_capture, read_json
 from rebrowse.models import CaptureResult
+from rebrowse.reverse.extractor import registrable_domain
 
 _STAMP = "-" + "[0-9]" * 8 + "-" + "[0-9]" * 6 + ".json"
 
@@ -54,6 +55,8 @@ def load_traffic(path: str | Path, domain: str | None = None) -> CaptureResult:
         capture = CaptureResult.model_validate(data)
     except ValidationError as e:
         raise ValueError(f"{path} is neither a HAR file nor a rebrowse capture") from e
-    if domain and domain.lower() != capture.domain.lower():
+    if not domain or domain.lower() == capture.domain.lower():
+        return capture
+    if registrable_domain(domain) != registrable_domain(capture.domain):
         raise ValueError(f"{path} is a capture of {capture.domain}, not {domain}")
-    return capture
+    return capture.model_copy(update={"domain": domain.lower()})
