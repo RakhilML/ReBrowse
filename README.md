@@ -45,9 +45,10 @@ rebrowse run "add a note saying hi" --yes          # confirm a call that changes
 rebrowse verify news.ycombinator.com               # health-check a skill's read endpoints
 rebrowse openapi news.ycombinator.com -o api.json  # OpenAPI 3.1 export (stdout without -o)
 rebrowse mock e2e.har [-p 8787]                    # serve the recorded API on 127.0.0.1
-rebrowse diff baseline.har e2e.har                 # API changes that break the client
-rebrowse contract e2e.har --against http://localhost:8000  # replay reads against a server
-rebrowse diff baseline.har e2e.har --accepted diff-accepted.json  # reviewed breaks pass
+rebrowse baseline e2e.har -o api-baseline.json     # a recording that is safe to commit
+rebrowse diff api-baseline.json e2e.har            # API changes that break the client
+rebrowse contract api-baseline.json --against http://localhost:8000  # replay reads
+rebrowse diff api-baseline.json e2e.har --accepted diff-accepted.json  # reviewed breaks pass
 rebrowse skills [-q "search"]  |  rebrowse show <id>  |  rebrowse delete <id>
 rebrowse auth set api.github.com ghp_xxx [--type bearer|header|query]
 rebrowse mcp                                       # MCP server over stdio
@@ -114,7 +115,7 @@ within one data directory: a fresh `~/.rebrowse` creates a new skill, with a new
 keeps raw traffic; never cache either, since pull-request workflows can restore a cache.
 Values that differ per session, such as a per-request id header or feed ids, still show up
 as example changes. To check whether a change breaks the client, compare the recordings:
-`rebrowse diff baseline.har e2e.har` (see [Drift report](#drift-report)).
+`rebrowse diff api-baseline.json e2e.har` (see [Drift report](#drift-report)).
 
 ## Import from HAR
 
@@ -147,11 +148,11 @@ when the request is redirected to an HTML sign-in page. Importing the same site 
 after a `build`, updates its skill and keeps its id. Endpoints seen before keep their ids,
 descriptions and `verify` results, and only endpoints without a description are sent to
 the LLM; the output reports what was `added`, `kept` and `dropped`. In CI, compare the e2e run's HAR with
-the one recorded on the main branch, which fails the job on a change that breaks the client
-(see [Drift report](#drift-report)):
+a baseline committed from the main branch, which fails the job on a change that breaks the client
+(see [Committable baselines](#committable-baselines) and [Drift report](#drift-report)):
 
 ```bash
-rebrowse diff baseline.har e2e.har
+rebrowse diff api-baseline.json e2e.har
 ```
 
 ## Mock server
@@ -203,16 +204,18 @@ answered.
 
 `rebrowse diff BASE HEAD` compares the API traffic in two recordings of the same app and
 reports what changed from the client's point of view, without a spec, an LLM or the network.
-BASE and HEAD are read as `mock` reads SOURCE: a HAR file, a capture saved by `build`, or a
-`host[:port]` whose newest saved capture is used. By default each side uses the host of its
-own first HTML page, so `prod.har` and `staging.har` line up; `--domain` picks the site in
-both files, or in BASE then HEAD when given twice. A side with no API traffic, such as a run
-that never got past sign-in, is an input error rather than a pass.
+BASE and HEAD are read as `mock` reads SOURCE: a HAR file, a capture saved by `build` or
+written by [`baseline`](#committable-baselines), or a `host[:port]` whose newest saved capture
+is used. By default each side uses the host of its own first HTML page, so `prod.har` and
+`staging.har` line up; `--domain` picks the site in both files, or in BASE then HEAD when
+given twice. A side with no API traffic, such as a run that never got past sign-in, is an
+input error rather than a pass.
 
 ```bash
-# main: run the e2e suite with browser.new_context(record_har_path="baseline.har"), keep it
-# PR:   run it again with record_har_path="e2e.har", then
-rebrowse diff baseline.har e2e.har       # exit 0: nothing breaks, 1: breaking, 2: bad input
+# main: run the e2e suite with browser.new_context(record_har_path="e2e.har"), then commit
+rebrowse baseline e2e.har -o api-baseline.json   # no credentials or response values
+# PR:   run it again, then
+rebrowse diff api-baseline.json e2e.har  # exit 0: nothing breaks, 1: breaking, 2: bad input
 rebrowse diff prod.har staging.har       # or two DevTools exports, or two build captures
 ```
 
@@ -267,10 +270,11 @@ skill, and nothing is stored. SOURCE is read as `mock` reads it, and ORIGIN is
 `scheme://host[:port]` with no path.
 
 ```bash
-# frontend, once: record the e2e run with browser.new_context(record_har_path="baseline.har")
-# and commit the HAR next to the backend. Backend CI, on every pull request:
+# frontend, once: record the e2e run with browser.new_context(record_har_path="e2e.har"),
+# write `rebrowse baseline e2e.har -o api-baseline.json` and commit that file next to the
+# backend, never the HAR. Backend CI, on every pull request:
 docker compose up -d --wait api && ./scripts/seed-fixtures.sh   # the data the recording saw
-REBROWSE_HOST_INTERVAL=0 rebrowse contract baseline.har --against http://api:8000
+REBROWSE_HOST_INTERVAL=0 rebrowse contract api-baseline.json --against http://api:8000
 # exit 0: compatible, 1: breaking change or failed replay, 2: bad input or no answer at all
 ```
 
@@ -289,23 +293,33 @@ REBROWSE_HOST_INTERVAL=0 rebrowse contract baseline.har --against http://api:800
   replay has one overall deadline and reads at most the size limit, so a stream or a huge
   export cannot hang the run.
 - **What is not sent.** The URL is ORIGIN plus the recorded path and query, with secret-named
-  path parameters such as `;jsessionid=` removed, secret-named query values redacted and the
-  fragment dropped. Cookies, `Authorization`, API-key, CSRF and session headers, headers whose
-  value looks like a credential, `Origin`, `Referer` and the conditional headers
-  (`If-None-Match`, `If-Modified-Since`, ...) and method overrides (`X-HTTP-Method-Override`)
-  are dropped, as are headers that are not valid
+  path parameters such as `;jsessionid=` removed, secret-named query values redacted, jQuery's
+  `_=<timestamp>` cache-buster and the fragment dropped. Cookies, `Authorization`, API-key,
+  CSRF and session headers, headers whose value looks like a credential, `Origin`, `Referer`,
+  the conditional headers (`If-None-Match`, `If-Modified-Since`, ...), method overrides
+  (`X-HTTP-Method-Override`) and per-request tracing headers (`traceparent`, `tracestate`,
+  `baggage`, `sentry-trace`, `X-Request-Id`, `X-Correlation-Id`, `X-Amzn-Trace-Id`, B3,
+  Datadog and New Relic headers, ...) are dropped, as are headers that are not valid
   HTTP as recorded (a non-token name, a value with control or non-ASCII characters), and the
-  User-Agent is rebrowse's own. Bodies of non-GET reads are redacted like the query. The only
+  User-Agent is rebrowse's own. Bodies of non-GET reads are redacted like the query, and so
+  are secret-named arguments written into a GraphQL document (`user(token: "...")`). The only
   credential that can be attached is an API key stored with `rebrowse auth set` for ORIGIN's
   own host; cookies are never sent, and keys stored for the recorded site never go to ORIGIN.
   A recording that cannot be sent at all, such as a URL over 64 KB, gives way to the next one,
   and a route left with none is skipped as `unreplayable`.
-- **Judging.** Recorded and live answers of the same requests are compared route by route
-  with the breaking rules of [`diff`](#drift-report) (`status`, `content_type`, `body_empty`,
-  `field_removed`, `field_optional`, `field_type`). Each request is also judged on its own: one
-  recorded with a 2xx or 304 that now answers with a redirect, a client error or a server
-  error, or one recorded with any status below 500 that now answers with a 5xx, is a breaking
-  `status` change for its route, even when other requests to that route still answer. A replay that gets no answer, such as a timeout or a refused connection, is a
+- **Judging.** Each request is sent once, and its live answer is compared with every recorded
+  answer to that same request (method, URL and body), so the order of the recording never
+  changes the verdict: a list loaded before and after a create is judged against the fields of
+  both answers. Answers are compared route by route with the breaking rules of
+  [`diff`](#drift-report) (`content_type`, `body_empty`, `field_removed`, `field_optional`,
+  `field_type`). Statuses are judged per request: one recorded with a 2xx or 304 that now
+  answers with a redirect, a client error or a server error, or one recorded only below 500
+  that now answers with a 5xx, is a breaking `status` change for its route, even when other
+  requests to that route still answer. A status the recording already holds for the same
+  request never breaks, so `/api/me` recorded as 401 before sign-in and 200 after passes when
+  ORIGIN answers 401, except a 5xx: a request recorded as a 500 and then, retried, as a 200
+  fails when ORIGIN answers 500. Other differences in a route's statuses are reported as info. A replay
+  that gets no answer, such as a timeout or a refused connection, is a
   breaking `no_response`, and so is any replayed route whose answer is no longer an API
   response, such as a JSON route at `/` answered with an HTML page. A
   challenge page is a breaking `blocked`, never data. A failed replay is left out of the
@@ -340,10 +354,10 @@ and no longer counts toward `breaking` or the exit code; any other break still f
 
 ```bash
 # on the pull request: accept this run's breaks, add a reason to each entry, commit the file
-rebrowse contract baseline.har --against http://localhost:8000 \
+rebrowse contract api-baseline.json --against http://localhost:8000 \
   --accepted contract-accepted.json --update-accepted
 # CI reads it and never rewrites it
-rebrowse contract baseline.har --against http://api:8000 --accepted contract-accepted.json
+rebrowse contract api-baseline.json --against http://api:8000 --accepted contract-accepted.json
 ```
 
 ```json
@@ -395,6 +409,78 @@ With `--accepted`, the report also holds `accepted` (how many changes were accep
 `stale` and `unchecked` (the entries), and `breaking` counts the unaccepted ones only. Exit
 codes keep their meaning. An invalid file, or a missing one without `--update-accepted`,
 exits 2 before `contract` sends a request.
+
+## Committable baselines
+
+`diff` and `contract` need a recording of how the API answered before a change, and a raw
+recording is not safe to keep. A HAR from Playwright, DevTools or a proxy holds the session's
+`Cookie`, `Authorization`, `Set-Cookie` and CSRF headers, tokens in URLs, every response value
+(names, emails, addresses, order totals) and megabytes of bundles and HTML; a capture saved by
+`build` keeps request credentials and `Set-Cookie` too. Committed, or kept as a CI artifact
+that pull-request jobs can read, it leaks a live session and customer data.
+`rebrowse baseline SOURCE` writes only what `diff`, `contract` and `mock` judge, as a capture
+file that each of them reads as SOURCE:
+
+```bash
+rebrowse baseline e2e.har -o api-baseline.json   # commit this file
+rebrowse diff api-baseline.json e2e.har [--accepted diff-accepted.json]
+rebrowse contract api-baseline.json --against http://api:8000
+rebrowse mock api-baseline.json
+```
+
+SOURCE is read as `mock` reads it, and `--domain` picks the site in a HAR. Without `-o` the
+baseline is written to stdout; with it, FILE is replaced in one step and a summary is printed:
+the source, domain, path, the number of routes, and how many requests were read and written.
+Nothing is sent over the network.
+
+- **What is kept.** The calls `diff` compares: same-site API calls, sibling hosts included,
+  with redirects and 304s, and their method, URL, status and `content-type`. Request paths,
+  and the query values and bodies of reads, stay as recorded, because `contract` replays them,
+  so ids, search terms and GraphQL variables are in the file: review it before the first
+  commit. An HTML page other than the site root is a route for `diff` (a deep link such as
+  `/app/dashboard?tab=billing`), so it is kept like any read, with its query values. The query
+  values of writes are emptied, except those that name or classify the call: the GraphQL
+  `operationName`, document and `extensions`, and `action`, `cmd`, `op` or `_method`.
+  The GraphQL document of a write without an `operationName` or persisted hash keeps its
+  literals too, apart from secret-named arguments, because its text names the route, so an
+  inline `createUser(email: "...")` stays: name the operation to have its literals emptied.
+  Request headers are the ones `contract` would send, such as
+  `accept` and `content-type`. Response bodies keep their structure and field names, the same
+  exposure as a `diff` report.
+- **What is removed.** Everything `contract` never sends: cookies, `Authorization`, API-key,
+  CSRF and session headers, `Origin`, `Referer`, tracing headers (`traceparent`, `baggage`,
+  `sentry-trace`, `X-Request-Id`, ...) and headers whose value looks like a credential, user
+  info, fragments, jQuery's `_=<timestamp>` cache-buster and secret-named path parameters such
+  as `;jsessionid=`. Secret-named query values and query values that hold a token (`Bearer
+  ...`, a JWT) become `<redacted>`, as `contract` sends them, and calls with a credential in
+  the path, matrix parameters included, are dropped. The recorded `final_url` loses its query,
+  and becomes the site root when its path holds a credential, as a magic-link page does. Secret-named values in read bodies, including
+  secret-named arguments in a GraphQL document (`login(password: "...")`), are redacted as
+  `contract` redacts them. Every response header but `content-type`, so `Set-Cookie` and
+  `Location`, is dropped. Every response value becomes a placeholder of its JSON type (`""`,
+  `0`, `0.5`, `false`, `null`); keys that `diff` reads as values (ids, emails, dates, tokens)
+  become `"0"`, `"1"`, ...; HTML, XML, text and JSONP bodies are dropped. Write bodies keep
+  only the `operationName` and `query` strings and the `extensions` object of each GraphQL
+  operation, with secret-named values redacted, and turn every other JSON value into a
+  placeholder; a form-encoded GraphQL write keeps the same three fields, and other form,
+  multipart and XML write bodies are dropped. In the document of a named or
+  persisted write, every number becomes `0` and every string and comment keeps only the words
+  that classify the call, a destructive verb or `mutation` (`bulk(action: "delete", note: "")`),
+  so its effect is the same as recorded. Calls that `diff` does not compare, such as the site
+  root page, static files, JS bundles, telemetry and other sites, are left out, as are the
+  HAR's cookie lists and timestamps, so the file is a few KB.
+- **Same verdicts.** `diff` reports exactly the same changes against a baseline as against its
+  recording, on either side: a placeholder has the JSON type `diff` reads (`4.0` stays an
+  integer, `1.5` a number), and identical array items and map entries are merged, which never
+  changes whether a field is in every response. `contract` judges each request against all of
+  its recorded answers, whatever their order, so it sends the same requests and reaches the
+  same judgement whenever no route has more than three distinct recorded reads; past that it
+  replays the first three in the baseline's sorted order. `mock` serves the placeholders with
+  the recorded status and `content-type`.
+- **Stable.** Requests are deduplicated and sorted, as are keys and array items, and no time,
+  trace id or cache-buster is written, so recording the same calls against an unchanged API
+  gives the same bytes and the pull-request diff of `api-baseline.json` reads as the API
+  change, such as `"total":0` becoming `"total":""`. A baseline of a baseline is the same file.
 
 ## Safety model
 

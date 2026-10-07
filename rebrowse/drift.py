@@ -37,7 +37,7 @@ def _is_token(key: str) -> bool:
     return bool(_TOKEN.fullmatch(key)) and len(_DIGITS.findall(key)) >= TOKEN_DIGIT_RUNS
 
 
-def _is_data_key(key: str) -> bool:
+def is_data_key(key: str) -> bool:
     """True for a key that holds a recorded value, such as an id, email, date or token."""
     return not _NAME.fullmatch(key) or looks_like_id(key) or _is_token(key)
 
@@ -66,7 +66,7 @@ class Shape:
                 items.add(item, depth + 1)
 
     def _member(self, name: str) -> Shape:
-        if _is_data_key(name):
+        if is_data_key(name):
             self.entries = self.entries or Shape()
             return self.entries
         return self.fields.setdefault(name, Shape())

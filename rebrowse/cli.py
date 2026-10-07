@@ -47,6 +47,7 @@ def main():
       mock <source>     serve recorded API responses on localhost
       diff <a> <b>      report API changes between two recordings
       contract <source> replay recorded reads against a server, report breaking changes
+      baseline <source> write a recording that is safe to commit (no credentials or response values)
       mcp               serve skills to agents over MCP (stdio)
     """
     ensure_dirs()
@@ -376,6 +377,49 @@ def contract(source: str, against: str, domain: str | None, accepted: Path | Non
     _settle_accepted("contract", report, accepted, entries, update_accepted, uncompared)
     _emit(report)
     sys.exit(1 if report["breaking"] else 0)
+
+
+@main.command(short_help="Write a recording that is safe to commit.")
+@click.argument("source")
+@click.option("--domain", "-d", default=None, metavar="HOST[:PORT]",
+              help="Site in a HAR to keep (default: host of the first HTML page).")
+@click.option("--out", "-o", type=click.Path(path_type=Path), default=None, metavar="FILE",
+              help="Write the baseline to FILE instead of stdout.")
+def baseline(source: str, domain: str | None, out: Path | None):
+    """Write the API traffic in SOURCE as a recording that is safe to commit.
+
+    SOURCE is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
+    capture is used. The output is a capture that diff, contract and mock read as SOURCE.
+    Credentials are removed as contract removes them before sending, every response value
+    becomes a placeholder of the same JSON type, and requests are sorted and deduplicated,
+    so the file is the same for the same API. Request paths, query values and the bodies of
+    reads are kept, since contract replays them. Nothing is sent over the network.
+    """
+    from rebrowse.baseline import baseline_bytes, make_baseline, write_baseline
+    from rebrowse.mock import build_routes
+
+    try:
+        path, capture = _traffic(source, domain)
+    except ValueError as e:
+        _emit({"error": str(e)})
+        return
+    result = make_baseline(capture)
+    if not result.requests:
+        _emit({"error": f"No API traffic for {capture.domain} in {path}"})
+        return
+    data = baseline_bytes(result)
+    if out is None:
+        click.get_binary_stream("stdout").write(data)
+        return
+    out = out.resolve()
+    try:
+        write_baseline(out, data)
+    except OSError as e:
+        _emit({"error": f"Could not write {out}: {e}"})
+        return
+    _emit({"source": str(path.resolve()), "domain": result.domain, "path": str(out),
+           "routes": len(build_routes(result, redirects=True)),
+           "recorded": len(capture.requests), "requests": len(result.requests)})
 
 
 @main.command()
