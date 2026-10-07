@@ -55,7 +55,13 @@ _JSONP = re.compile(r"(\s*(?:/\*\*/)?\s*[\w$.]+\s*\(\s*)(.*?)(\s*\)\s*;?\s*)", r
 _CAS_TICKETS = ("ST-", "PT-")
 FORM = "application/x-www-form-urlencoded"
 _MUTATION_DEFINITION = re.compile(r"(?:^|[\s},])mutation\b")
-_ACTION_KEYS = frozenset({"action", "cmd", "command", "op", "do", "task", "method", "_method"})
+_INNER_MUTATION = re.compile(r"[\s},]mutation\b")
+ACTION_KEYS = frozenset({"action", "cmd", "command", "op", "do", "task", "method", "_method"})
+_GRAPHQL_TOKEN = re.compile(
+    r'"""(?:\\"""|(?!""")[\s\S])*(?:"""|\Z)|"(?:\\[\s\S]|[^"\\\n\r])*"?|#[^\n\r]*'
+    r"|-?[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|[_A-Za-z][_0-9A-Za-z]*|\S")
+_GRAPHQL_NAME = re.compile(r"[_A-Za-z][_0-9A-Za-z]*")
+_GRAPHQL_NUMBER = re.compile(r"-?[0-9]")
 
 
 def _words(text: str) -> set[str]:
@@ -94,7 +100,7 @@ def _has_destructive_mutation(body: Any) -> bool:
 
 def _action_words(url: str) -> set[str]:
     query = urlsplit(url).query if "//" in url else ""
-    return {word for key, value in parse_qsl(query) if key.lower() in _ACTION_KEYS
+    return {word for key, value in parse_qsl(query) if key.lower() in ACTION_KEYS
             for word in _words(value)}
 
 
@@ -159,9 +165,73 @@ def _named_secret(pair: dict) -> bool:
     return "value" in pair and isinstance(name, str) and is_secret_name(name)
 
 
+def _is_literal(token: str) -> bool:
+    return token.startswith('"') or bool(_GRAPHQL_NUMBER.match(token))
+
+
+def _value_end(tokens: list[re.Match], start: int) -> int | None:
+    first = tokens[start].group()
+    if _is_literal(first):
+        return start
+    if first not in ("[", "{"):
+        return None
+    depth = 0
+    for index in range(start, len(tokens)):
+        token = tokens[index].group()
+        depth += (token in ("[", "{")) - (token in ("]", "}"))
+        if depth == 0:
+            return index
+    return len(tokens) - 1
+
+
+def _replaced(text: str, spans: list[tuple[int, int]], replacement: str) -> str:
+    parts, last = [], 0
+    for start, end in spans:
+        parts += [text[last:start], replacement]
+        last = end
+    return "".join(parts) + text[last:]
+
+
+def redact_document(document: str) -> str:
+    """DOCUMENT with the value of each secret-named GraphQL argument or input field redacted."""
+    tokens = [m for m in _GRAPHQL_TOKEN.finditer(document) if m.group()[0] not in ",#"]
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index + 2 < len(tokens):
+        name, colon = tokens[index].group(), tokens[index + 1].group()
+        secret = colon == ":" and _GRAPHQL_NAME.fullmatch(name) and is_secret_name(name)
+        end = _value_end(tokens, index + 2) if secret else None
+        if end is None:
+            index += 1
+            continue
+        spans.append((tokens[index + 2].start(), tokens[end].end()))
+        index = end + 1
+    return _replaced(document, spans, f'"{REDACTED}"') if spans else document
+
+
+def _blank_token(match: re.Match) -> str:
+    token = match.group()
+    if token[0] in '"#':
+        kept = " ".join(sorted(_words(token) & _DESTRUCTIVE_VERBS))
+        kept += " mutation" if _INNER_MUTATION.search(token) else ""
+        return f"#{kept}" if token[0] == "#" else f'"{kept}"'
+    return "0" if _GRAPHQL_NUMBER.match(token) else token
+
+
+def blank_document(document: str) -> str:
+    """DOCUMENT without literal values, keeping the words classify_effect reads in them."""
+    return _GRAPHQL_TOKEN.sub(_blank_token, document)
+
+
+def _redact_value(name: str, value: Any) -> Any:
+    redacted = redact(value)
+    return redact_document(redacted) if name == "query" and isinstance(redacted, str) else redacted
+
+
 def redact(value: Any) -> Any:
     if isinstance(value, dict):
-        out = {k: REDACTED if is_secret_name(str(k)) else redact(v) for k, v in value.items()}
+        out = {k: REDACTED if is_secret_name(str(k)) else _redact_value(str(k), v)
+               for k, v in value.items()}
         return {**out, "value": REDACTED} if _named_secret(value) else out
     if isinstance(value, list):
         return [redact(v) for v in value]
@@ -179,7 +249,8 @@ def _secret_pair(name: str, value: str, names: set[str]) -> bool:
 def redact_pairs(text: str) -> str:
     pairs = parse_qsl(text, keep_blank_values=True)
     names = {k.lower() for k, _ in pairs}
-    redacted = [(redact(k), REDACTED if _secret_pair(k, v, names) else redact(v)) for k, v in pairs]
+    redacted = [(redact(k), REDACTED if _secret_pair(k, v, names) else _redact_value(k, v))
+                for k, v in pairs]
     return text if redacted == pairs else urlencode(redacted)
 
 

@@ -6,8 +6,9 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit
 
-from rebrowse.safety import graphql_kind_of_query
+from rebrowse.safety import Effect, classify_effect, graphql_kind_of_query, redact_document
 
 
 @dataclass
@@ -24,7 +25,8 @@ class GraphQLOp:
         if self.hash:
             return f"gql#{self.hash[:16]}"
         if self.query:
-            return "gqlq:" + hashlib.sha1(self.query.encode("utf-8")).hexdigest()[:12]
+            document = redact_document(self.query).encode("utf-8")
+            return "gqlq:" + hashlib.sha1(document).hexdigest()[:12]
         return "gql:anon"
 
     def label(self) -> str:
@@ -93,3 +95,12 @@ def graphql_ops(body: Any, query_params: dict | None = None) -> list[GraphQLOp]:
             ops.append(GraphQLOp(name=name, kind=kind, body=None, query=query, hash=pq))
 
     return ops
+
+
+def request_effect(method: str, url: str, body: Any) -> Effect:
+    """The most severe effect of a request's parsed body and of each GraphQL operation in it."""
+    ops = graphql_ops(body, dict(parse_qsl(urlsplit(url).query)))
+    bodies = [op.body if op.body is not None else {"operationName": op.name, "query": op.query}
+              for op in ops]
+    effects = {classify_effect(method, url, item) for item in [body, *bodies]}
+    return max(effects, key=list(Effect).index)

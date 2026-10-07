@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+from urllib.parse import parse_qsl, urlencode
+
 import pytest
 
 from rebrowse.execution.executor import execute_endpoint
 from rebrowse.models import EndpointDescriptor, HttpMethod, SkillManifest
-from rebrowse.safety import REDACTED, Effect, classify_effect, is_secret_name, redact, redact_body
+from rebrowse.safety import (
+    REDACTED,
+    Effect,
+    blank_document,
+    classify_effect,
+    is_secret_name,
+    redact,
+    redact_body,
+    redact_document,
+    redact_pairs,
+)
 
 
 @pytest.mark.parametrize("method,url,body,expected", [
@@ -118,3 +130,38 @@ def test_redact_body_handles_a_bom_jsonp_and_form_responses():
     assert redact_body("token=t&n=1", "application/x-www-form-urlencoded") == (
         "token=%3Credacted%3E&n=1")
     assert redact_body("cb(1)") == "cb(1)"
+
+
+@pytest.mark.parametrize("document,redacted", [
+    ('mutation { login(email: "a@x.test", password: "p") { ok } }',
+     'mutation { login(email: "a@x.test", password: "<redacted>") { ok } }'),
+    ('query { a(token: 42, apiKey: """x\n\\""" y""") { b } }',
+     'query { a(token: "<redacted>", apiKey: "<redacted>") { b } }'),
+    ('mutation { a(tokens: ["x", "y"], credentials: {user: "u", pass: "p"}, n: 1) { b } }',
+     'mutation { a(tokens: "<redacted>", credentials: "<redacted>", n: 1) { b } }'),
+    ('query Q($token: String) { a(token: $token, sid: null) { token: b } }',
+     'query Q($token: String) { a(token: $token, sid: null) { token: b } }'),
+    ('query { a(q: "token: \\"x\\"") # password: "y"\n { b } }',
+     'query { a(q: "token: \\"x\\"") # password: "y"\n { b } }'),
+    ('query { a(token: "unterminated', 'query { a(token: "<redacted>"'),
+])
+def test_redact_document_hides_the_values_of_secret_named_arguments(document, redacted):
+    assert redact_document(document) == redacted
+    assert redact({"query": document, "n": 1}) == {"query": redacted, "n": 1}
+    assert parse_qsl(redact_pairs(urlencode({"query": document}))) == [("query", redacted)]
+
+
+@pytest.mark.parametrize("document,blank", [
+    ('mutation Save { save(text: "ann@x.test", n: -1.5e3, tags: ["a"], on: true) { id } }',
+     'mutation Save { save(text: "", n: 0, tags: [""], on: true) { id } }'),
+    ('mutation Run { run(action: "Delete all", why: "a mutation") { ok } } # cancel it',
+     'mutation Run { run(action: "delete", why: " mutation") { ok } } #cancel'),
+    ('query { search(q: "gene mutation") { id } }', 'query { search(q: " mutation") { id } }'),
+])
+def test_blank_document_empties_literals_but_keeps_the_effect(document, blank):
+    url = "https://x.com/graphql"
+
+    assert blank_document(document) == blank
+    assert blank_document(blank) == blank
+    assert (classify_effect("POST", url, {"query": blank})
+            == classify_effect("POST", url, {"query": document}))

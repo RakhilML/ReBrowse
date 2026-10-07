@@ -25,6 +25,14 @@ def test_non_graphql_json_is_not_graphql():
     assert graphql_ops({"foo": "bar"}) == []
 
 
+def test_an_anonymous_operation_is_identified_without_its_secrets():
+    def token(query: str) -> str:
+        return graphql_ops({"query": query})[0].dedup_token()
+
+    assert token('{ a(token: "x") { b } }') == token('{ a(token: "<redacted>") { b } }')
+    assert token('{ a(id: 1) { b } }') != token('{ a(id: 2) { b } }')
+
+
 def test_get_persisted_query_from_params():
     ops = graphql_ops(
         {},
