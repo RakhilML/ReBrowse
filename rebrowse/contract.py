@@ -3,42 +3,35 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections import Counter
 from http import HTTPStatus
 from itertools import islice
 from typing import NamedTuple
-from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import httpx
 
 from rebrowse import config, drift, net
 from rebrowse.auth.vault import get_api_key
-from rebrowse.capture.har import clean_url, credential_value, replayable_header
+from rebrowse.capture.har import content_type_of, credential_in_path, scrub_url, sendable_headers
 from rebrowse.execution import executor
 from rebrowse.mock import LOOPBACK, Recording, Route, build_routes
 from rebrowse.models import CaptureResult, RawRequest
 from rebrowse.reverse.extractor import is_api_request
-from rebrowse.reverse.graphql import graphql_ops
-from rebrowse.safety import Effect, classify_effect, redact_body
+from rebrowse.reverse.graphql import request_effect
+from rebrowse.safety import Effect, redact_body
 
 MAX_REPLAYS_PER_ROUTE = 3
 DEADLINE_FACTOR = 3
 NO_RESPONSE, BLOCKED = "no_response", "blocked"
 NON_API = "answered with a non-API response"
 UNREPLAYABLE = "unreplayable"
-_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
-_NOT_SENT = frozenset({
-    "origin", "referer", "content-encoding",
-    "if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "if-range",
-    "x-http-method-override", "x-http-method", "x-method-override",
-})
 _RECEIVED = ("content-encoding", "content-length", "transfer-encoding")
 
 
 class Replay(NamedTuple):
     route: Route
-    recorded: RawRequest
+    recordings: list[RawRequest]
     request: httpx.Request
 
 
@@ -64,38 +57,33 @@ def parse_target(text: str) -> str:
     return f"{parts.scheme}://{host}{port}"
 
 
-def _effect(req: RawRequest, rec: Recording) -> Effect:
-    ops = graphql_ops(rec.body, dict(parse_qsl(urlsplit(req.url).query)))
-    bodies = [op.body if op.body is not None else {"operationName": op.name, "query": op.query}
-              for op in ops]
-    effects = {classify_effect(req.method, req.url, body) for body in [rec.body, *bodies]}
-    return max(effects, key=list(Effect).index)
-
-
-def _credential_in_path(url: str) -> bool:
-    return any(credential_value(unquote(segment)) for segment in urlsplit(url).path.split("/"))
-
-
 def _skip_reason(route: Route, req: RawRequest, rec: Recording) -> str | None:
     if route.host:
         return "other host"
-    effect = _effect(req, rec)
+    effect = request_effect(req.method, req.url, rec.body)
     if effect is not Effect.READ:
         return effect.value
     if rec.status == HTTPStatus.NOT_MODIFIED:
         return "not modified"
     if "event-stream" in rec.content_type.lower():
         return "stream"
-    return "credential in path" if _credential_in_path(req.url) else None
+    return "credential in path" if credential_in_path(req.url) else None
 
 
-def _candidates(route: Route, requests: list[RawRequest]) -> list[RawRequest]:
-    unique: dict[tuple[str, str, str | None], RawRequest] = {}
+def _candidates(route: Route, requests: list[RawRequest]) -> list[list[RawRequest]]:
+    """The recordings of each distinct request to ROUTE that may be replayed."""
+    groups: dict[tuple[str, str, str | None], list[RawRequest]] = {}
     for rec in route.recordings:
         req = requests[rec.index]
         if _skip_reason(route, req, rec) is None:
-            unique.setdefault((req.method, req.url, req.request_body), req)
-    return list(unique.values())
+            key = (req.method, scrub_url(req.url) or req.url, req.request_body)
+            groups.setdefault(key, []).append(req)
+    return list(groups.values())
+
+
+def _sent_from(recordings: list[RawRequest]) -> RawRequest:
+    """The recording a request is sent as, whatever order its recordings were made in."""
+    return min(recordings, key=lambda req: sorted(sendable_headers(req.request_headers).items()))
 
 
 def _build(req: RawRequest, target: str) -> httpx.Request | None:
@@ -105,13 +93,13 @@ def _build(req: RawRequest, target: str) -> httpx.Request | None:
         return None
 
 
-def _picks(route: Route, candidates: list[RawRequest], target: str) -> list[Replay]:
-    built = (Replay(route, req, request) for req in candidates
-             if (request := _build(req, target)) is not None)
+def _picks(route: Route, candidates: list[list[RawRequest]], target: str) -> list[Replay]:
+    built = (Replay(route, group, request) for group in candidates
+             if (request := _build(_sent_from(group), target)) is not None)
     return list(islice(built, MAX_REPLAYS_PER_ROUTE))
 
 
-def _skipped(route: Route, requests: list[RawRequest], candidates: list[RawRequest]) -> dict:
+def _skipped(route: Route, requests: list[RawRequest], candidates: list[list[RawRequest]]) -> dict:
     first = route.recordings[0]
     reason = UNREPLAYABLE if candidates else _skip_reason(route, requests[first.index], first)
     return {"route": route.name, "reason": reason}
@@ -129,21 +117,8 @@ def plan(capture: CaptureResult, target: str) -> tuple[list[Replay], list[dict]]
     return replays, skipped
 
 
-def _content_type(headers: dict[str, str]) -> str:
-    return next((value for name, value in headers.items() if name.lower() == "content-type"), "")
-
-
-def _sendable(name: str, value: str) -> bool:
-    return (bool(_HEADER_NAME.fullmatch(name)) and value.isascii() and value.isprintable()
-            and replayable_header(name) and name.lower() not in _NOT_SENT
-            and not credential_value(value))
-
-
 def _headers(recorded: dict[str, str]) -> dict[str, str]:
-    stripped = {name: value.strip() for name, value in recorded.items()}
-    headers = {name: value for name, value in stripped.items() if _sendable(name, value)}
-    headers["User-Agent"] = config.REBROWSE_UA
-    return headers
+    return {**sendable_headers(recorded), "User-Agent": config.REBROWSE_UA}
 
 
 def _query(recorded: str, key_query: dict[str, str]) -> str:
@@ -159,9 +134,9 @@ def _target_key(target: str) -> dict | None:
 
 def replay_request(req: RawRequest, target: str) -> httpx.Request:
     """Raises httpx.InvalidURL or ValueError for a recording that cannot be sent."""
-    recorded = clean_url(req.url)
+    recorded = scrub_url(req.url)
     if recorded is None:
-        raise ValueError("the recorded URL is not an http(s) URL")
+        raise ValueError("the recorded URL is not an http(s) URL without a credential")
     parts = urlsplit(recorded)
     headers = _headers(req.request_headers)
     key_query: dict[str, str] = {}
@@ -171,7 +146,7 @@ def replay_request(req: RawRequest, target: str) -> httpx.Request:
     url = f"{target}{parts.path or '/'}" + (f"?{query}" if query else "")
     body = None
     if req.method != "GET" and req.request_body is not None:
-        body = redact_body(req.request_body, _content_type(req.request_headers))
+        body = redact_body(req.request_body, content_type_of(req.request_headers))
     return httpx.Request(req.method, url, headers=headers, content=body)
 
 
@@ -189,7 +164,7 @@ def _live(req: RawRequest, resp: httpx.Response) -> RawRequest:
 def _judge(replay: Replay, resp: httpx.Response) -> RawRequest | Failure:
     if reason := executor.blocked_reason(resp):
         return Failure(replay.route.name, BLOCKED, reason)
-    live = _live(replay.recorded, resp)
+    live = _live(replay.recordings[0], resp)
     return live if is_api_request(live) else Failure(replay.route.name, NO_RESPONSE, NON_API)
 
 
@@ -249,15 +224,23 @@ def _failures(failed: list[Failure]) -> list[dict]:
              "failed": counts[f.route]} for f in first.values()]
 
 
+def _regressed(recorded: set[int], live: int) -> bool:
+    answered = {status for status in recorded if status < 500}
+    if live in answered:
+        return False
+    if live >= 500:
+        return bool(answered)
+    return drift.status_breaks(recorded, {live})
+
+
 def _regressions(answers: list[Answer]) -> list[dict]:
     statuses: dict[str, tuple[set[int], set[int]]] = {}
     for replay, live in answers:
-        before, after = {replay.recorded.response_status}, {live.response_status}
-        new_error = live.response_status >= 500 > replay.recorded.response_status
-        if new_error or drift.status_breaks(before, after):
+        before = {req.response_status for req in replay.recordings}
+        if _regressed(before, live.response_status):
             was, now = statuses.setdefault(replay.route.name, (set(), set()))
             was.update(before)
-            now.update(after)
+            now.add(live.response_status)
     return [{"severity": drift.BREAKING, "kind": "status", "route": route, "base": sorted(was),
              "head": sorted(now)} for route, (was, now) in statuses.items()]
 
@@ -267,7 +250,7 @@ def _side(capture: CaptureResult, requests: list[RawRequest]) -> CaptureResult:
 
 
 def _changes(capture: CaptureResult, answers: list[Answer], failed: list[Failure]) -> list[dict]:
-    base = _side(capture, [replay.recorded for replay, _ in answers])
+    base = _side(capture, [req for replay, _ in answers for req in replay.recordings])
     head = _side(capture, [live for _, live in answers])
     regressions = _regressions(answers)
     regressed = {change["route"] for change in regressions}
@@ -281,8 +264,10 @@ def _changes(capture: CaptureResult, answers: list[Answer], failed: list[Failure
                 failures.append({"severity": drift.BREAKING, "kind": NO_RESPONSE,
                                  "route": change["route"], "error": NON_API,
                                  "failed": answered[change["route"]]})
-        elif not (change["kind"] == "status" and change["route"] in regressed):
+        elif change["kind"] != "status":
             drifted.append(change)
+        elif change["route"] not in regressed:
+            drifted.append({**change, "severity": drift.INFO})
     return sorted(regressions + drifted + failures, key=lambda change: change["route"])
 
 

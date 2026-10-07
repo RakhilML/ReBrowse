@@ -817,3 +817,85 @@ def test_a_saved_capture_can_be_tested_on_a_sibling_host(fixture_site):
 
     assert code == 2 and "1 other host; pass --domain" in report["error"]
     assert (moved_code, moved["domain"], moved["replayed"]) == (0, "api.app.test", 1)
+
+
+@pytest.mark.parametrize("first, then", [
+    ({"items": [{"id": 1, "text": "a"}]}, {"items": []}),
+    ({"items": []}, {"items": [{"id": 1, "text": "a"}]}),
+], ids=["full then empty", "empty then full"])
+def test_a_request_recorded_twice_is_judged_against_both_answers(tmp_path, first, then):
+    with _running(_scripted({
+        "/api/notes": (200, "application/json", json.dumps({"items": [{"id": 1}]}).encode()),
+    })) as origin:
+        code, report = _contract(tmp_path, [_get("/api/notes", first), _get("/api/notes", then)],
+                                 origin)
+
+    assert (code, report["replayed"], report["answered"]) == (1, 1, 1)
+    assert _rows(report) == [
+        ("field_removed", "GET /api/notes", "$.items[].text", ["string"], None)]
+
+
+def test_a_status_already_recorded_for_the_request_never_breaks(tmp_path):
+    with _running(_scripted({
+        "/api/me": (401, "application/json", b'{"error": "sign in"}'),
+        "/api/orders/7": (302, "text/html", b""),
+    })) as origin:
+        code, report = _contract(tmp_path, [
+            _get("/api/me", {"error": "x"}, status=401), _get("/api/me", {"id": 1}),
+            _get("/api/orders/7", {"error": "x"}, status=404), _get("/api/orders/7", {"id": 7}),
+        ], origin)
+
+    assert code == 1
+    assert [(c["severity"], c["route"], c["base"], c["head"]) for c in report["changes"]] == [
+        ("info", "GET /api/me", [200, 401], [401]),
+        ("breaking", "GET /api/orders/7", [200, 404], [302]),
+    ]
+
+
+def test_a_request_recorded_with_other_headers_is_sent_alike_in_any_order():
+    recordings = [
+        RawRequest(url=f"{SITE}/api/items", method="GET", response_status=200,
+                   request_headers={"Accept": accept}, response_body=json.dumps(ITEMS),
+                   response_headers={"content-type": "application/json"})
+        for accept in ("application/json", "*/*")]
+
+    sent = [contract.plan(CaptureResult(domain="app.local", final_url=f"{SITE}/",
+                                        requests=requests), "http://127.0.0.1:9")[0]
+            for requests in (recordings, recordings[::-1])]
+
+    assert [[replay.request.headers["accept"] for replay in replays] for replays in sent] == [
+        ["*/*"], ["*/*"]]
+
+
+def test_tracing_headers_and_cache_busters_are_not_sent():
+    req = RawRequest(
+        url=f"{SITE}/api/items?page=2&_=1759740000000&q=a%20b", method="GET", response_status=200,
+        request_headers={
+            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "tracestate": "congo=t61rcWkgMzE", "sentry-trace": "4bf92f35-00f067aa-1",
+            "baggage": "sentry-user_id=ann%40corp.test,sentry-environment=prod",
+            "X-Request-Id": "r-1", "X-Correlation-Id": "c-1", "X-Amzn-Trace-Id": "Root=1-a",
+            "X-B3-TraceId": "4bf92f35", "X-Datadog-Trace-Id": "123", "newrelic": "eyJ2Ijpb",
+            "X-Cloud-Trace-Context": "105445aa7843bc8bf206b1/1", "Accept": "application/json"})
+
+    request = contract.replay_request(req, "http://127.0.0.1:9")
+
+    assert str(request.url) == "http://127.0.0.1:9/api/items?page=2&q=a%20b"
+    assert dict(request.headers) == {
+        "host": "127.0.0.1:9", "accept": "application/json", "user-agent": config.REBROWSE_UA}
+
+
+def test_secret_named_graphql_arguments_are_sent_redacted():
+    document = 'query User { user(id: 1001, token: "SECRET") { id } }'
+    post = RawRequest(url=f"{SITE}/graphql", method="POST", response_status=200,
+                      request_headers={"Content-Type": "application/json"},
+                      request_body=json.dumps({"operationName": "User", "query": document}))
+    get = RawRequest(url=f"{SITE}/graphql?{urlencode({'query': document})}", method="GET",
+                     response_status=200)
+
+    sent_post, sent_get = (contract.replay_request(req, "http://127.0.0.1:9")
+                           for req in (post, get))
+
+    redacted = 'query User { user(id: 1001, token: "<redacted>") { id } }'
+    assert json.loads(sent_post.content)["query"] == redacted
+    assert parse_qs(sent_get.url.query.decode())["query"] == [redacted]
