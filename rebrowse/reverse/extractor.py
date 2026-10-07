@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from rebrowse.models import EndpointDescriptor, HttpMethod, Idempotency, RawRequest, ResponseSchema
@@ -107,6 +108,7 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 NUMERIC_RE = re.compile(r"^\d{2,}$")
 HEX_RE = re.compile(r"^[0-9a-f]{16,}$", re.IGNORECASE)
 PLACEHOLDER_RE = re.compile(r"\{([^{}/]+)\}")
+_SURROGATE = re.compile(r"\\u[dD][89a-fA-F]|[\ud800-\udfff]")
 
 
 def is_sensitive_header(name: str) -> bool:
@@ -164,6 +166,12 @@ def normalize_url(raw_url: str) -> tuple[str, dict[str, str]]:
 def canonical_template(template: str) -> str:
     """Erase placeholder names, so /u/{id} and /u/{users_id} compare equal."""
     return PLACEHOLDER_RE.sub("{}", template)
+
+
+def endpoint_key(ep: EndpointDescriptor) -> tuple[str, str, str]:
+    """The identity extraction dedupes on, recomputed from an endpoint's stored fields."""
+    ops = "|".join(op.dedup_token() for op in graphql_ops(ep.body, ep.query))
+    return ep.method.value, canonical_template(ep.url_template), ops
 
 
 def _score_request(req: RawRequest) -> float:
@@ -320,12 +328,27 @@ def is_api_request(req: RawRequest) -> bool:
     )
 
 
+def _scrub(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(value, list):
+        return [_scrub(v) for v in value]
+    if isinstance(value, dict):
+        return {_scrub(k): _scrub(v) for k, v in value.items()}
+    return value
+
+
+def _loads(text: str) -> Any:
+    value = json.loads(text)
+    return _scrub(value) if _SURROGATE.search(text) else value
+
+
 def _infer_schema(body: str | None) -> ResponseSchema | None:
     """Try to infer a response schema from a JSON body."""
     if not body:
         return None
     try:
-        data = json.loads(body)
+        data = _loads(body)
     except (json.JSONDecodeError, TypeError):
         return None
 
@@ -414,7 +437,7 @@ def _merge_schemas(bodies: list[str | None]) -> ResponseSchema | None:
         if not b:
             continue
         try:
-            values.append(json.loads(b))
+            values.append(_loads(b))
         except (json.JSONDecodeError, TypeError):
             continue
     if not values:
@@ -530,7 +553,7 @@ def parse_body(body: str | None):
         return None
     body = split_xssi(body)[1]
     try:
-        return json.loads(body)
+        return _loads(body)
     except (json.JSONDecodeError, TypeError):
         pass
     # Try form-urlencoded
