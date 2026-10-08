@@ -169,8 +169,8 @@ def test_openapi_stays_offline_and_away_from_the_vault(runner, monkeypatch):
 
 
 def test_group_help_lists_openapi(runner):
-    assert "openapi <target>  export a skill as an OpenAPI 3.1 document" in runner.invoke(
-        main, ["--help"]).output
+    assert ("openapi <target>  export a skill or a recording as an OpenAPI 3.1 document"
+            in runner.invoke(main, ["--help"]).output)
 
 
 def test_openapi_redirected_stdout_is_utf8_json(isolated):

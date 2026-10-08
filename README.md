@@ -44,6 +44,7 @@ rebrowse run "add a note saying hi" --yes          # confirm a call that changes
 
 rebrowse verify news.ycombinator.com               # health-check a skill's read endpoints
 rebrowse openapi news.ycombinator.com -o api.json  # OpenAPI 3.1 export (stdout without -o)
+rebrowse openapi api-baseline.json -o api.json     # ... from a recording, no LLM or skill
 rebrowse mock e2e.har [-p 8787]                    # serve the recorded API on 127.0.0.1
 rebrowse baseline e2e.har -o api-baseline.json     # a recording that is safe to commit
 rebrowse diff api-baseline.json e2e.har            # API changes that break the client
@@ -93,11 +94,12 @@ reliability score; `run` skips failed endpoints and ranks the rest.
 
 ## OpenAPI export
 
-`rebrowse openapi <target>` turns a skill into an OpenAPI 3.1 JSON document that Swagger UI
+`rebrowse openapi <target>` turns a skill, or a recording (see
+[From a recording](#from-a-recording)), into an OpenAPI 3.1 JSON document that Swagger UI
 or Redoc can render, Prism can mock (`prism mock api.json`) and Schemathesis can
-contract-test. Each operation carries `x-rebrowse-effect` (`read`/`write`/`destructive`),
-`x-rebrowse-verification` and `x-rebrowse-observed` (`false` for routes found only in a JS
-bundle), so a test run can be limited to reads. Response schemas mark fields seen in every
+contract-test. Each operation carries `x-rebrowse-effect` (`read`/`write`/`destructive`), so
+a test run can be limited to reads; a skill's export also carries `x-rebrowse-verification`
+and `x-rebrowse-observed` (`false` for routes found only in a JS bundle). Response schemas mark fields seen in every
 sample as required; GraphQL operations sharing one URL are merged into one documented
 operation. The export runs offline, never includes cookies or auth headers, and redacts
 values whose names look secret (`password`, `passwd`, `token`, `csrf`, `session`, `api_key`,
@@ -109,13 +111,68 @@ changes exactly when the document does. Re-learning a recording that carries the
 requests and values gives a byte-identical file, because kept endpoints keep their
 descriptions, which makes a committed `api.json` diff read as an API change log. This holds
 within one data directory: a fresh `~/.rebrowse` creates a new skill, with a new
-`x-rebrowse-skill-id` and new LLM descriptions, so in CI cache and restore
+`x-rebrowse-skill-id` and new LLM descriptions, so in CI document the committed baseline
+instead (see [From a recording](#from-a-recording)), or cache and restore
 `$REBROWSE_DATA_DIR/skills.db` between runs, and only that file. It holds no secrets, while
 `vault/` keeps stored API keys and cookies next to the key that decrypts them and `captures/`
 keeps raw traffic; never cache either, since pull-request workflows can restore a cache.
 Values that differ per session, such as a per-request id header or feed ids, still show up
 as example changes. To check whether a change breaks the client, compare the recordings:
 `rebrowse diff api-baseline.json e2e.har` (see [Drift report](#drift-report)).
+
+### From a recording
+
+When TARGET is a file, a HAR, a capture saved by `build` or a
+[baseline](#committable-baselines), `rebrowse openapi` documents its traffic directly
+(`--domain` picks the site in a HAR, as for `mock`). No LLM, embedding model or `skills.db`
+is involved, nothing is stored and nothing is sent over the network, so a DevTools export
+becomes docs in one offline command:
+
+```bash
+rebrowse openapi session.har -o api.json
+# CI: regenerate the docs from the baseline committed for diff and contract
+rebrowse openapi api-baseline.json -o docs/openapi.json && git diff --exit-code docs/openapi.json
+```
+
+- **Same bytes.** The recording is first reduced to what `baseline` keeps, and the document
+  is built from that alone, so a HAR and the baseline written from it give byte-identical
+  documents, as does a new recording of the same calls against an unchanged API. `info`
+  holds the title and a `version` hashed from the rest of the document; no skill id, time or
+  source path.
+- **Operations.** The routes `diff` compares: same-site API calls with ids templated,
+  redirects and 304s included. A path recorded on a sibling host lists its origins under the
+  operation's `servers`. GraphQL operations sharing a URL are one operation that names them
+  in `x-rebrowse-graphql`, with one request example per operation. `x-rebrowse-effect` is the
+  most severe effect among the operation's calls. Query and header parameters are required
+  when every recorded call sent them.
+- **Responses.** Each recorded status is its own response, so a route that answered 200, 404
+  and a 302 to the sign-in page documents all three; a status outside 100-599, such as a
+  proxy's 999, is documented as `default`. 204, 205 and 304 responses have no
+  content, nor does a response recorded without a content type, such as a bare 302 (browsers
+  write `x-unknown` for these in a HAR). A body that is not JSON, such as an HTML page, is
+  listed by media type alone. Responses carry schemas, never values.
+- **Schemas as `diff` reads them.** Every recorded body counts, down to 12 levels, and a
+  field is `required` when every object recorded at its place had it, the rule by which
+  `diff` and `contract` call its removal breaking. They agree on a route on one host with one
+  2xx status and one media type; where this document merges GraphQL operations or sibling
+  hosts, a field only one of them always returns is optional here, and where a route
+  answered with two 2xx statuses or media types, `required` is per status and media type
+  while `diff` pools them. `integer` folds into `number` when both were seen, and a field seen
+  as a string and as null is `["null", "string"]`. Keys that hold values, such as ids, emails, dates and
+  tokens, are documented as `additionalProperties`,
+  never as property names, so `{"members": {"ann@corp.test": {"role": "admin"}}}` documents
+  `members.additionalProperties.properties.role`.
+- **What is left out.** Everything `baseline` drops: credentials, cookies, response values,
+  calls with a credential in the path and cache-busters; secret-named query, body and GraphQL
+  argument values read `<redacted>`. Request examples are the baseline's, so read bodies keep
+  their values and write bodies hold placeholders. A JSON body sent as `text/plain` (fetch's
+  default) gets a schema like any JSON body. A form-encoded GraphQL write keeps its operation
+  fields; other form, multipart and XML write bodies are not documented, since `baseline`
+  drops them.
+- **Compared with the skill export.** There are no LLM descriptions (summaries read
+  `GET /api/orders/{orders_id}`), no routes found only in JS bundles and no `verify` health;
+  those stay with the skill export. A TARGET that is not a file is still a skill id or domain,
+  and a file wins over a skill of the same name.
 
 ## Import from HAR
 

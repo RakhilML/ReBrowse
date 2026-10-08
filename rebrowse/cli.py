@@ -44,7 +44,7 @@ def main():
       import-har <har>  build a skill from a HAR export (DevTools, proxy, e2e run)
       run <prompt>      pick a saved API for a request and call it
       verify <target>   health-check a skill's read endpoints
-      openapi <target>  export a skill as an OpenAPI 3.1 document
+      openapi <target>  export a skill or a recording as an OpenAPI 3.1 document
       mock <source>     serve recorded API responses on localhost
       diff <a> <b>      report API changes between two recordings
       contract <source> replay recorded reads against a server, report breaking changes
@@ -114,36 +114,68 @@ def verify(target: str):
     _emit(asyncio.run(do_verify(target)))
 
 
-@main.command()
-@click.argument("target")
-@click.option("--out", "-o", type=click.Path(dir_okay=False, path_type=Path), default=None,
-              help="Write the document to FILE instead of stdout.")
-def openapi(target: str, out: Path | None):
-    """Export a skill as an OpenAPI 3.1 document (JSON).
+def _recording_document(source: str, domain: str | None) -> tuple[dict, dict]:
+    """Document the recording file SOURCE; raises ValueError."""
+    from rebrowse.openapi import recording_to_openapi
 
-    TARGET is a skill id or domain. Nothing is sent over the network, and sensitive
-    values in bodies, query strings and headers are redacted.
-    """
+    path, capture = _traffic(source, domain)
+    document = recording_to_openapi(capture)
+    if not document["paths"]:
+        raise ValueError(f"No API traffic for {capture.domain} in {path}")
+    return document, {"source": str(path.resolve()), "domain": capture.domain}
+
+
+def _skill_document(target: str) -> tuple[dict, dict]:
+    """Export the skill TARGET names; raises ValueError."""
     from rebrowse.openapi import skill_to_openapi
     from rebrowse.store.skills import resolve_skill
 
     skill = resolve_skill(target)
     if skill is None:
-        _emit({"error": f"No skill matching '{target}'."})
-        return
-    document = skill_to_openapi(skill)
-    text = json.dumps(document, indent=2, ensure_ascii=False)
-    if out is None:
-        click.get_binary_stream("stdout").write((text + "\n").encode("utf-8"))
+        raise ValueError(f"No skill matching '{target}'.")
+    return skill_to_openapi(skill), {"skill_id": skill.skill_id, "domain": skill.domain}
+
+
+@main.command()
+@click.argument("target")
+@click.option("--domain", "-d", default=None, metavar="HOST[:PORT]",
+              help="Site in a HAR to document (default: host of the first HTML page).")
+@click.option("--out", "-o", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Write the document to FILE instead of stdout.")
+def openapi(target: str, domain: str | None, out: Path | None):
+    """Export a skill or a recording as an OpenAPI 3.1 document (JSON).
+
+    TARGET is a HAR file, a capture saved by build or a baseline, documented from its
+    traffic with no LLM or skill, so a HAR and the baseline written from it give the same
+    bytes. Any other TARGET is a skill id or domain. Nothing is sent over the network, and
+    sensitive values in bodies, query strings and headers are redacted.
+    """
+    recording = Path(target).is_file()
+    if domain and not recording:
+        raise click.UsageError("--domain needs a recording file as TARGET")
+    if not recording and ("/" in target or "\\" in target or target.endswith((".har", ".json"))):
+        _emit({"error": f"No such file: {target}"})
         return
     try:
-        out.write_text(text + "\n", encoding="utf-8", newline="\n")
+        if recording:
+            document, summary = _recording_document(target, domain)
+        else:
+            document, summary = _skill_document(target)
+    except ValueError as e:
+        _emit({"error": str(e)})
+        return
+    data = (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode(
+        "utf-8", errors="backslashreplace")
+    if out is None:
+        click.get_binary_stream("stdout").write(data)
+        return
+    try:
+        out.write_bytes(data)
     except OSError as e:
         _emit({"error": f"Could not write {out}: {e}"})
         return
     _emit({
-        "skill_id": skill.skill_id,
-        "domain": skill.domain,
+        **summary,
         "path": str(out.resolve()),
         "paths": len(document["paths"]),
         "operations": sum(len(methods) for methods in document["paths"].values()),
