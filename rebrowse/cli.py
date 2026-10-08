@@ -75,14 +75,16 @@ def build(url: str, steps: str | None):
 
 
 @main.command("import-har", short_help="Build a skill from a HAR export, without a browser.")
-@click.argument("file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("file", type=click.Path(exists=True, path_type=Path))
 @click.option("--domain", "-d", default=None, metavar="HOST[:PORT]",
               help="Site in the HAR to learn (default: host of the first HTML page).")
 def import_har(file: Path, domain: str | None):
     """Build a skill from a HAR file exported by browser DevTools, a proxy or a test run.
 
-    No request is replayed. Cookies, Authorization and other credential headers are dropped,
-    and secret-named query and body values are redacted before anything is stored.
+    FILE may also be a directory of HAR files, such as an e2e suite's test-results, read as
+    one recording. No request is replayed. Cookies, Authorization and other credential
+    headers are dropped, and secret-named query and body values are redacted before anything
+    is stored.
     """
     from rebrowse.orchestrator.pipeline import import_har as do_import
 
@@ -117,10 +119,10 @@ def verify(target: str):
 
 
 def _recording_document(source: str, domain: str | None) -> tuple[dict, dict]:
-    """Document the recording file SOURCE; raises ValueError."""
+    """Document the recording file or HAR directory SOURCE; raises ValueError."""
     from rebrowse.openapi import recording_to_openapi
 
-    path, capture = _traffic(source, domain)
+    path, capture = _traffic("openapi", source, domain)
     document = recording_to_openapi(capture)
     if not document["paths"]:
         raise ValueError(f"No API traffic for {capture.domain} in {path}")
@@ -147,14 +149,19 @@ def _skill_document(target: str) -> tuple[dict, dict]:
 def openapi(target: str, domain: str | None, out: Path | None):
     """Export a skill or a recording as an OpenAPI 3.1 document (JSON).
 
-    TARGET is a HAR file, a capture saved by build or a baseline, documented from its
-    traffic with no LLM or skill, so a HAR and the baseline written from it give the same
-    bytes. Any other TARGET is a skill id or domain. Nothing is sent over the network, and
-    sensitive values in bodies, query strings and headers are redacted.
+    TARGET is a HAR file or a directory of HAR files, a capture saved by build or a
+    baseline, documented from its traffic with no LLM or skill, so a HAR and the baseline
+    written from it give the same bytes. Any other TARGET is a skill id or domain. Nothing is
+    sent over the network, and sensitive values in bodies, query strings and headers are
+    redacted.
     """
-    recording = Path(target).is_file()
+    if not target.strip():
+        _emit({"error": "TARGET is empty; pass a recording or a skill id or domain"})
+        return
+    path = Path(target)
+    recording = path.is_file() or path.is_dir()
     if domain and not recording:
-        raise click.UsageError("--domain needs a recording file as TARGET")
+        raise click.UsageError("--domain needs a recording file or directory as TARGET")
     if not recording and ("/" in target or "\\" in target or target.endswith((".har", ".json"))):
         _emit({"error": f"No such file: {target}"})
         return
@@ -200,19 +207,28 @@ def _netloc(text: str) -> str:
     return urlsplit(text).netloc if "://" in text else text
 
 
-def _traffic(source: str, domain: str | None,
+def _traffic(command: str, source: str, domain: str | None,
              every_script: bool = False) -> tuple[Path, CaptureResult]:
-    """Load SOURCE as a file, else the newest saved capture of that host; raises ValueError."""
-    from rebrowse.capture.store import latest_capture, load_traffic, saved_domains
+    """Read SOURCE as a file or HAR directory, else its host's newest capture; raises ValueError."""
+    from rebrowse.capture.store import latest_capture, read_recording, saved_domains
 
+    if not source.strip():
+        raise ValueError("SOURCE is empty; pass a HAR file, a directory of them, a capture or "
+                         "a host")
+    netloc = _netloc(domain) if domain else None
     path: Path | None = Path(source)
+    if path.is_dir():
+        capture, count = read_recording(path, netloc, every_script)
+        click.echo(f"[{command}] read {_count(count, 'HAR file', 'HAR files')} under {path}",
+                   err=True)
+        return path, capture
     if not path.is_file():
         path = latest_capture(_netloc(source))
     if path is None:
         saved = ", ".join(saved_domains()) or "none"
         raise ValueError(f"'{source}' is neither a file nor a domain with a saved capture "
                          f"(saved: {saved}). For an imported HAR, pass the HAR file.")
-    return path, load_traffic(path, _netloc(domain) if domain else None, every_script)
+    return path, read_recording(path, netloc, every_script)[0]
 
 
 @main.command(short_help="Serve recorded API responses on 127.0.0.1.")
@@ -224,15 +240,15 @@ def _traffic(source: str, domain: str | None,
 def mock(source: str, domain: str | None, port: int):
     """Answer a frontend's API calls from recorded traffic, on 127.0.0.1 only.
 
-    SOURCE is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
-    capture is used. Requests are matched on templated paths and GraphQL operations.
-    Nothing is forwarded to the real site, secret-named values in responses are redacted,
-    and no recorded header but content-type is sent back.
+    SOURCE is a HAR file or a directory of HAR files, a capture saved by build, or a
+    HOST[:PORT] whose newest saved capture is used. Requests are matched on templated paths
+    and GraphQL operations. Nothing is forwarded to the real site, secret-named values in
+    responses are redacted, and no recorded header but content-type is sent back.
     """
     from rebrowse.mock import MockServer, build_routes, route_table
 
     try:
-        path, capture = _traffic(source, domain)
+        path, capture = _traffic("mock", source, domain)
     except ValueError as e:
         _emit({"error": str(e)})
         return
@@ -340,12 +356,13 @@ def diff(base: str, head: str, domains: tuple[str, ...], accepted: Path | None,
          update_accepted: bool):
     """Report the API changes from BASE to HEAD that can break their client.
 
-    Each is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
-    capture is used. Nothing is sent over the network, and the report holds routes,
-    statuses, media types, field paths and JSON types, never a response value (object keys
-    that read like names do appear, as field names). Breaking changes listed in the
-    --accepted FILE are reported as accepted. Exits 1 when a change is breaking and not
-    accepted, and 2 when an input or FILE cannot be read or an input holds no API traffic.
+    Each is a HAR file or a directory of HAR files, a capture saved by build, or a
+    HOST[:PORT] whose newest saved capture is used. Nothing is sent over the network, and
+    the report holds routes, statuses, media types, field paths and JSON types, never a
+    response value (object keys that read like names do appear, as field names). Breaking
+    changes listed in the --accepted FILE are reported as accepted. Exits 1 when a change
+    is breaking and not accepted, and 2 when an input or FILE cannot be read or an input
+    holds no API traffic.
     """
     from rebrowse.drift import BREAKING, compare_facts, route_facts
 
@@ -354,8 +371,8 @@ def diff(base: str, head: str, domains: tuple[str, ...], accepted: Path | None,
     base_domain, head_domain = (domains * 2)[:2] if domains else (None, None)
     try:
         entries = _accepted_entries(accepted, update_accepted)
-        base_path, base_capture = _traffic(base, base_domain)
-        head_path, head_capture = _traffic(head, head_domain)
+        base_path, base_capture = _traffic("diff", base, base_domain)
+        head_path, head_capture = _traffic("diff", head, head_domain)
     except ValueError as e:
         _emit({"error": str(e)}, error_code=2)
         return
@@ -404,16 +421,16 @@ def contract(source: str, against: str, header_env: tuple[str, ...], domain: str
              follow_ids: bool, accepted: Path | None, update_accepted: bool):
     """Replay the reads recorded in SOURCE against ORIGIN and report what breaks the client.
 
-    SOURCE is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
-    capture is used. Only reads are sent, at most three per route, one at a time, without
-    retries or following redirects; calls to sibling hosts are skipped. Secret-named values
-    are redacted and recorded credentials and cookies are never sent. The credentials sent
-    to ORIGIN are the --header-env headers and an API key stored with 'auth set' for
-    ORIGIN's host; rebrowse never signs in itself. Answers are judged as diff judges them,
-    and breaking changes listed in the --accepted FILE are reported as accepted; a failed
-    replay cannot be accepted. Exits 1 when a change is breaking and not accepted or a
-    replay failed, and 2 on bad input or FILE, no reads to replay, when ORIGIN never
-    answered, or when it refused or redirected every read the recording answered.
+    SOURCE is a HAR file or a directory of HAR files, a capture saved by build, or a
+    HOST[:PORT] whose newest saved capture is used. Only reads are sent, at most three per
+    route, one at a time, without retries or following redirects; calls to sibling hosts are
+    skipped. Secret-named values are redacted and recorded credentials and cookies are never
+    sent. The credentials sent to ORIGIN are the --header-env headers and an API key stored
+    with 'auth set' for ORIGIN's host; rebrowse never signs in itself. Answers are judged as
+    diff judges them, and breaking changes listed in the --accepted FILE are reported as
+    accepted; a failed replay cannot be accepted. Exits 1 when a change is breaking and not
+    accepted or a replay failed, and 2 on bad input or FILE, no reads to replay, when ORIGIN
+    never answered, or when it refused or redirected every read the recording answered.
     """
     from rebrowse.contract import (
         BLOCKED,
@@ -434,7 +451,7 @@ def contract(source: str, against: str, header_env: tuple[str, ...], domain: str
         raise click.BadParameter(str(e), param_hint="--header-env")
     try:
         entries = _accepted_entries(accepted, update_accepted)
-        path, capture = _traffic(source, domain)
+        path, capture = _traffic("contract", source, domain)
     except ValueError as e:
         _emit({"error": str(e)}, error_code=2)
         return
@@ -473,8 +490,9 @@ def contract(source: str, against: str, header_env: tuple[str, ...], domain: str
 def baseline(source: str, domain: str | None, out: Path | None):
     """Write the API traffic in SOURCE as a recording that is safe to commit.
 
-    SOURCE is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
-    capture is used. The output is a capture that diff, contract and mock read as SOURCE.
+    SOURCE is a HAR file or a directory of HAR files, a capture saved by build, or a
+    HOST[:PORT] whose newest saved capture is used. The output is a capture that diff,
+    contract and mock read as SOURCE.
     Credentials are removed as contract removes them before sending, every response value
     becomes a placeholder of the same JSON type, and requests are sorted and deduplicated,
     so the file is the same for the same API. Request paths, query values and the bodies of
@@ -486,7 +504,7 @@ def baseline(source: str, domain: str | None, out: Path | None):
     from rebrowse.mock import build_routes
 
     try:
-        path, capture = _traffic(source, domain)
+        path, capture = _traffic("baseline", source, domain)
     except ValueError as e:
         _emit({"error": str(e)})
         return
@@ -520,17 +538,17 @@ def coverage(source: str, domain: str | None, fail_under: float | None):
     """Report the API routes and GraphQL operations that SOURCE's own JS bundles reference and
     SOURCE never recorded with a 2xx or 304 answer, with the effect of each.
 
-    SOURCE is a HAR file, whose first-party scripts are all read, a capture saved by build,
-    which keeps a limited number of scripts, or a HOST[:PORT] whose newest saved
-    capture is used; a baseline keeps no JS. Nothing is sent over the network, no LLM is
-    called and no bundle source is printed. Exits 1 when coverage is below --fail-under, and 2
-    when SOURCE cannot be read, holds no first-party JS, or its JS references nothing rebrowse
-    can find.
+    SOURCE is a HAR file or a directory of HAR files, whose first-party scripts are all read,
+    a capture saved by build, which keeps a limited number of scripts, or a HOST[:PORT] whose
+    newest saved capture is used; a baseline keeps no JS. Nothing is sent over the network,
+    no LLM is called and no bundle source is printed. Exits 1 when coverage is below
+    --fail-under, and 2 when SOURCE cannot be read, holds no first-party JS, or its JS
+    references nothing rebrowse can find.
     """
     from rebrowse.coverage import coverage_report
 
     try:
-        path, capture = _traffic(source, domain, every_script=True)
+        path, capture = _traffic("coverage", source, domain, every_script=True)
         report = coverage_report(capture)
     except ValueError as e:
         _emit({"error": str(e)}, error_code=2)

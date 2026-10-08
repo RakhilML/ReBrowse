@@ -574,7 +574,7 @@ def test_a_domain_missing_from_the_har_exits_1_and_leaves_no_file(tmp_path):
     code, report = _invoke("openapi", str(_write(tmp_path, _app())), "-d", "nothere.test",
                            "-o", str(out))
 
-    assert code == 1 and report["error"].startswith("No requests to nothere.test in the HAR")
+    assert code == 1 and report["error"].startswith("No requests to nothere.test in the recording")
     assert not out.exists()
 
 

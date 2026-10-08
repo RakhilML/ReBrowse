@@ -51,6 +51,7 @@ rebrowse diff api-baseline.json e2e.har            # API changes that break the 
 rebrowse contract api-baseline.json --against http://localhost:8000 --follow-ids  # replay reads
 rebrowse diff api-baseline.json e2e.har --accepted diff-accepted.json  # reviewed breaks pass
 rebrowse coverage e2e.har --fail-under 80          # API calls in the JS the recording missed
+rebrowse coverage test-results/                    # any SOURCE may be a folder of HAR files
 rebrowse skills [-q "search"]  |  rebrowse show <id>  |  rebrowse delete <id>
 rebrowse auth set api.github.com ghp_xxx [--type bearer|header|query]
 rebrowse mcp                                       # MCP server over stdio
@@ -125,7 +126,8 @@ as example changes. To check whether a change breaks the client, compare the rec
 ### From a recording
 
 When TARGET is a file, a HAR, a capture saved by `build` or a
-[baseline](#committable-baselines), `rebrowse openapi` documents its traffic directly
+[baseline](#committable-baselines), or a [directory of HAR files](#many-recordings),
+`rebrowse openapi` documents its traffic directly
 (`--domain` picks the site in a HAR, as for `mock`). No LLM, embedding model or `skills.db`
 is involved, nothing is stored and nothing is sent over the network, so a DevTools export
 becomes docs in one offline command:
@@ -173,8 +175,8 @@ rebrowse openapi api-baseline.json -o docs/openapi.json && git diff --exit-code 
   drops them.
 - **Compared with the skill export.** There are no LLM descriptions (summaries read
   `GET /api/orders/{orders_id}`), no routes found only in JS bundles and no `verify` health;
-  those stay with the skill export. A TARGET that is not a file is still a skill id or domain,
-  and a file wins over a skill of the same name.
+  those stay with the skill export. A TARGET that is not a file or directory is still a skill
+  id or domain, and a file or directory wins over a skill of the same name.
 
 ## Import from HAR
 
@@ -184,9 +186,11 @@ and builds the same kind of skill, without launching a browser or replaying any 
 
 - **Browser DevTools.** Sign in yourself, use the app, then in the Network panel choose
   "Save all as HAR" (Chrome) or "Save All As HAR" (Firefox).
-- **An e2e suite.** Playwright records one with
-  `browser.new_context(record_har_path="e2e.har")`, so every flow the tests exercise ends up
-  in the skill.
+- **An e2e suite.** Record one HAR per test and import the folder,
+  `rebrowse import-har test-results/` (see [Many recordings](#many-recordings)), so every
+  flow the tests exercise ends up in the skill. `browser.new_context(record_har_path="e2e.har")`
+  gives a single file only when every test shares that one context, and @playwright/test
+  gives each test its own.
 - **A proxy.** mitmproxy, Charles and Proxyman all export HAR.
 
 The skill is learned for one site: `--domain host[:port]`, defaulting to the host of the
@@ -214,12 +218,82 @@ a baseline committed from the main branch, which fails the job on a change that 
 rebrowse diff api-baseline.json e2e.har
 ```
 
+## Many recordings
+
+An e2e suite rarely writes one HAR. @playwright/test gives every test a fresh browser context,
+so recording per context leaves one HAR per test, and parallel workers write their own. Cypress
+HAR plugins write one per spec, and DevTools exports made by hand cover one area of an app at a
+time. Every command that reads a recording (`openapi`, `mock`, `baseline`, `diff`, `contract`,
+`coverage` and `import-har`) also takes a directory, and reads every file under it whose name
+ends in `.har`, in any case and at any depth, as one recording:
+
+```bash
+rebrowse baseline test-results/ -o api-baseline.json
+rebrowse coverage test-results/ --fail-under 80
+rebrowse diff api-baseline.json test-results/
+rebrowse diff main-hars/ pr-hars/
+```
+
+- **Order.** Files are read in the order of their path below the directory, written with `/`
+  and compared as plain strings (`B/x.har` before `a/x.har`), so a tree reads the same way on
+  Windows, macOS and Linux. Directory symlinks and junctions are not followed, and dot
+  folders, `node_modules`, `__MACOSX` and AppleDouble `._*.har` files are skipped, so pointing
+  rebrowse at a repo root reads only your own recordings.
+- **One recording.** Requests are kept in file order, and a script recorded in several files
+  is read once, from the first. The site is chosen once, over every file, as for one HAR:
+  `--domain`, else the host of the first HTML page. A file with no call to the site is fine,
+  since it may hold only sibling-host or third-party calls. `coverage` reads every same-site
+  script in every file, and `import-har` scans at most 20, counted over all files.
+- **One file at a time.** Each file is parsed and has its credentials dropped before the next
+  is opened, so memory holds one raw HAR plus what rebrowse keeps.
+- **Same bytes.** `baseline` sorts and deduplicates, so `baseline test-results/` writes the
+  same file as a baseline of one HAR holding the same calls, and renaming or reordering the
+  files changes nothing unless it changes which site is chosen. The same holds for `openapi`.
+- **Errors.** A directory with no `.har` file is an input error, and so is a `.har` that is not
+  valid JSON or HAR, such as one cut short by a crashed test, which the error names. Nothing is
+  written, so a broken file never silently shrinks a baseline. The exit code is the command's
+  own for bad input.
+- **Output.** stderr gets one line, such as `[baseline] read 14 HAR files under test-results`,
+  and the JSON on stdout keeps its shape, with `source` set to the directory. A directory wins
+  over a saved capture of a host with the same name, as a file does.
+
+Captures and baselines (`.json`) in the directory are not read, nor are Playwright's `.zip`
+HAR archives. A fixture that records each test into its own folder under `test-results/`:
+
+```ts
+// fixtures.ts; specs import { test, expect } from './fixtures'
+import { test as base } from '@playwright/test';
+
+export const test = base.extend({
+  contextOptions: async ({ contextOptions }, use, testInfo) => {
+    await use({ ...contextOptions, recordHar: { path: testInfo.outputPath('network.har') } });
+  },
+});
+export { expect } from '@playwright/test';
+```
+
+```python
+# conftest.py, with pytest-playwright
+import re
+
+import pytest
+
+
+@pytest.fixture
+def context(browser, browser_context_args, request):
+    name = re.sub(r"[^\w.-]+", "-", request.node.nodeid)
+    context = browser.new_context(**browser_context_args,
+                                  record_har_path=f"test-results/{name}/network.har")
+    yield context
+    context.close()  # writes the HAR
+```
+
 ## Mock server
 
 `rebrowse mock SOURCE` answers a frontend's API calls from recorded traffic, so the UI,
-Storybook or an e2e suite can run without the real backend. SOURCE is a HAR file, a capture
-saved by `build`, or a `host[:port]` whose newest saved capture is used (`--domain` picks the
-site in a HAR, as for `import-har`):
+Storybook or an e2e suite can run without the real backend. SOURCE is a HAR file or a
+[directory of them](#many-recordings), a capture saved by `build`, or a `host[:port]` whose
+newest saved capture is used (`--domain` picks the site in a HAR, as for `import-har`):
 
 ```bash
 rebrowse mock e2e.har                                     # http://127.0.0.1:8787
@@ -263,18 +337,18 @@ answered.
 
 `rebrowse diff BASE HEAD` compares the API traffic in two recordings of the same app and
 reports what changed from the client's point of view, without a spec, an LLM or the network.
-BASE and HEAD are read as `mock` reads SOURCE: a HAR file, a capture saved by `build` or
-written by [`baseline`](#committable-baselines), or a `host[:port]` whose newest saved capture
-is used. By default each side uses the host of its own first HTML page, so `prod.har` and
+BASE and HEAD are read as `mock` reads SOURCE: a HAR file or a directory of them, a capture
+saved by `build` or written by [`baseline`](#committable-baselines), or a `host[:port]` whose
+newest saved capture is used. By default each side uses the host of its own first HTML page, so `prod.har` and
 `staging.har` line up; `--domain` picks the site in both files, or in BASE then HEAD when
 given twice. A side with no API traffic, such as a run that never got past sign-in, is an
 input error rather than a pass.
 
 ```bash
-# main: run the e2e suite with browser.new_context(record_har_path="e2e.har"), then commit
-rebrowse baseline e2e.har -o api-baseline.json   # no credentials or response values
+# main: run the e2e suite with a HAR per test (see Many recordings), then commit
+rebrowse baseline test-results/ -o api-baseline.json   # no credentials or response values
 # PR:   run it again, then
-rebrowse diff api-baseline.json e2e.har  # exit 0: nothing breaks, 1: breaking, 2: bad input
+rebrowse diff api-baseline.json test-results/  # exit 0: nothing breaks, 1: breaking, 2: bad input
 rebrowse diff prod.har staging.har       # or two DevTools exports, or two build captures
 ```
 
@@ -329,9 +403,9 @@ skill, and nothing is stored. SOURCE is read as `mock` reads it, and ORIGIN is
 `scheme://host[:port]` with no path.
 
 ```bash
-# frontend, once: record the e2e run with browser.new_context(record_har_path="e2e.har"),
-# write `rebrowse baseline e2e.har -o api-baseline.json` and commit that file next to the
-# backend, never the HAR. Backend CI, on every pull request:
+# frontend, once: record the e2e run with a HAR per test (see Many recordings), write
+# `rebrowse baseline test-results/ -o api-baseline.json` and commit that file next to the
+# backend, never the HARs. Backend CI, on every pull request:
 docker compose up -d --wait api    # seeded with a few fixtures of its own
 REBROWSE_HOST_INTERVAL=0 rebrowse contract api-baseline.json --against http://api:8000 --follow-ids
 # exit 0: compatible, 1: breaking change or failed replay,
@@ -580,8 +654,9 @@ Nothing is sent over the network.
   info, fragments, jQuery's `_=<timestamp>` cache-buster and secret-named path parameters such
   as `;jsessionid=`. Secret-named query values and query values that hold a token (`Bearer
   ...`, a JWT) become `<redacted>`, as `contract` sends them, and calls with a credential in
-  the path, matrix parameters included, are dropped. The recorded `final_url` loses its query,
-  and becomes the site root when its path holds a credential, as a magic-link page does. Secret-named values in read bodies, including
+  the path, matrix parameters included, are dropped. The recorded `final_url` becomes the site
+  root, such as `https://app.example.com/`, since the page a run opens first is not part of
+  the API and would change the file whenever tests are renamed or reordered. Secret-named values in read bodies, including
   secret-named arguments in a GraphQL document (`login(password: "...")`), are redacted as
   `contract` redacts them. Every response header but `content-type`, so `Set-Cookie` and
   `Location`, is dropped. Every response value becomes a placeholder of its JSON type (`""`,
@@ -622,12 +697,12 @@ Nothing is sent over the network.
 Docs, mocks, baselines and contract runs cover only the calls a recording happened to make.
 `rebrowse coverage SOURCE` checks the recording against the frontend's own JS and lists the API
 calls the JS can make that the recording never exercised, writes included. SOURCE is read as
-`mock` reads it: a HAR file, a capture saved by `build`, or a `host[:port]` whose newest saved
-capture is used (`--domain` picks the site in a HAR).
+`mock` reads it: a HAR file or a directory of them, a capture saved by `build`, or a
+`host[:port]` whose newest saved capture is used (`--domain` picks the site in a HAR).
 
 ```bash
-rebrowse coverage e2e.har                   # what the e2e suite never called
-rebrowse coverage e2e.har --fail-under 80   # CI: exit 1 when coverage is below 80%
+rebrowse coverage test-results/                   # what the whole e2e suite never called
+rebrowse coverage test-results/ --fail-under 80   # CI: exit 1 when coverage is below 80%
 ```
 
 The JSON report gives the number of `bundles` scanned, the API routes and GraphQL operations
@@ -655,8 +730,9 @@ same input gives the same bytes.
   (`operation:"mutation",name:{kind:"Name",value:"Checkout"}`). Fragments and text such as
   `"query failed ("` or `` `query failed (${status})` `` are not operations. Telemetry paths
   are dropped.
-- **Every script in a HAR.** coverage reads every same-site script in a HAR, whatever their
-  number or size. A capture saved by `build` keeps at most 20 scripts under 2 MB each, so for
+- **Every script in a HAR.** coverage reads every same-site script in a HAR, or in every HAR
+  of a directory, whatever their number or size. Run it on the whole suite's folder, since
+  one test's HAR exercises only a sliver of the routes a shared bundle references. A capture saved by `build` keeps at most 20 scripts under 2 MB each, so for
   a large app, or as a CI gate, run coverage on a HAR.
 - **Matching.** Hosts are ignored, because bundle paths are relative to the origin. A reference
   matches the end of a recorded route, so an axios `baseURL` still lines up:

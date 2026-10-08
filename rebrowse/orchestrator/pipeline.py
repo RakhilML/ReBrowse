@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from rebrowse.auth.vault import store_cookies
 from rebrowse.capture.browser import capture_session
 from rebrowse.capture.har import HarError, load_har
-from rebrowse.capture.store import save_capture
+from rebrowse.capture.store import read_recording, save_capture
 from rebrowse.execution.executor import execute_endpoint
 from rebrowse.llm.client import LLMError, describe_endpoints, parse_intent, pick_endpoint
 from rebrowse.models import CaptureResult, EndpointDescriptor, SkillManifest, VerificationStatus
@@ -216,13 +216,22 @@ async def build(url: str, steps: str | None = None) -> dict:
     return {**await _learn(capture, url, "build"), "timing_ms": _elapsed(t0)}
 
 
+def _read_hars(path: Path, domain: str | None) -> CaptureResult:
+    """Read the HAR file PATH, or every HAR file under the directory PATH; raises HarError."""
+    if not path.is_dir():
+        return load_har(path, domain)
+    capture, count = read_recording(path, domain)
+    _log(f"[import-har] read {count} HAR file{'' if count == 1 else 's'} under {path}")
+    return capture
+
+
 async def import_har(path: Path, domain: str | None = None) -> dict:
     t0 = time.time()
     try:
-        capture = load_har(path, domain)
+        capture = _read_hars(path, domain)
     except HarError as e:
         return {"error": str(e), "timing_ms": _elapsed(t0)}
-    _log(f"[import-har] Read {len(capture.requests)} requests for {capture.domain} from {path}")
+    _log(f"[import-har] read {len(capture.requests)} requests for {capture.domain} from {path}")
     if not capture.requests:
         return {"error": f"No requests to import from {path}", "timing_ms": _elapsed(t0)}
     return {
