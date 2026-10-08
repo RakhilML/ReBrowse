@@ -1,14 +1,15 @@
-"""Turn a recording into one that is safe to commit: no credentials and no response values."""
+"""Turn a recording into one safe to commit: no credentials, no response values but sent ids."""
 
 from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from rebrowse import drift
+from rebrowse import drift, follow
 from rebrowse.capture.har import (
     clean_url,
     content_type_of,
@@ -39,8 +40,8 @@ def _distinct(values: Iterable[Any]) -> list[Any]:
     return [unique[key] for key in sorted(unique)]
 
 
-def _object(value: dict, depth: int) -> dict:
-    members = {key: _placeholder(child, depth + 1) for key, child in value.items()
+def _object(value: dict, depth: int, linked: AbstractSet[str]) -> dict:
+    members = {key: _placeholder(child, depth + 1, linked, key) for key, child in value.items()
                if not drift.is_data_key(key)}
     entries = _distinct(_placeholder(child, depth + 1) for key, child in value.items()
                         if drift.is_data_key(key))
@@ -48,14 +49,17 @@ def _object(value: dict, depth: int) -> dict:
     return dict(sorted(members.items()))
 
 
-def _placeholder(value: Any, depth: int = 0) -> Any:
-    """A value that diff reads as it reads VALUE, holding nothing that was recorded."""
+def _placeholder(value: Any, depth: int = 0, linked: AbstractSet[str] = frozenset(),
+                 key: str | None = None) -> Any:
+    """A value that diff reads as it reads VALUE, keeping only the LINKED ids reads send."""
     if isinstance(value, (dict, list)) and depth >= drift.MAX_DEPTH:
         return type(value)()
     if isinstance(value, dict):
-        return _object(value, depth)
+        return _object(value, depth, linked)
     if isinstance(value, list):
-        return _distinct(_placeholder(item, depth + 1) for item in value)
+        return _distinct(_placeholder(item, depth + 1, linked, key) for item in value)
+    if follow.id_leaf(key, value) and str(value) in linked:
+        return value
     if isinstance(value, bool):
         return False
     if isinstance(value, int) or (isinstance(value, float) and value.is_integer()):
@@ -134,7 +138,7 @@ def _request_body(req: RawRequest, read: bool) -> str | None:
     return _write_body(req.request_body)
 
 
-def _response_body(text: str | None) -> str | None:
+def _response_body(text: str | None, linked: AbstractSet[str]) -> str | None:
     if not text:
         return text
     guard, rest = split_xssi(text)
@@ -142,7 +146,7 @@ def _response_body(text: str | None) -> str | None:
         body = json.loads(rest)
     except (ValueError, RecursionError):
         return None
-    return guard + _compact(_placeholder(body))
+    return guard + _compact(_placeholder(body, linked=linked))
 
 
 def _scrub(req: RawRequest) -> RawRequest | None:
@@ -165,14 +169,21 @@ def _scrub(req: RawRequest) -> RawRequest | None:
         request_body=request_body,
         response_status=req.response_status,
         response_headers={"content-type": content_type} if content_type and printable else {},
-        response_body=_response_body(req.response_body),
     )
 
 
-def _routed(capture: CaptureResult) -> list[RawRequest]:
+def _routed_indexes(capture: CaptureResult) -> list[int]:
     """The requests diff and contract read: same-site API calls with redirects and 304s."""
-    return [capture.requests[rec.index] for route in build_routes(capture, redirects=True)
+    return [rec.index for route in build_routes(capture, redirects=True)
             for rec in route.recordings]
+
+
+def _routed(capture: CaptureResult) -> list[RawRequest]:
+    return [capture.requests[index] for index in _routed_indexes(capture)]
+
+
+def _read(req: RawRequest) -> bool:
+    return request_effect(req.method, req.url, parse_body(req.request_body)) is Effect.READ
 
 
 def _key(req: RawRequest) -> str:
@@ -185,11 +196,16 @@ def _order(req: RawRequest) -> tuple:
 
 
 def make_baseline(capture: CaptureResult) -> CaptureResult:
-    """The calls diff, contract and mock judge, without credentials or response values."""
-    scrubbed = [clean for req in _routed(capture) if (clean := _scrub(req)) is not None]
+    """The calls diff, contract and mock judge, without credentials or values but sent ids."""
+    pairs = [(req, clean) for req in _routed(capture) if (clean := _scrub(req)) is not None]
     site = CaptureResult(domain=capture.domain, final_url=_page_url(capture.final_url),
-                         requests=scrubbed)
-    unique = {_key(req): req for req in _routed(site)}
+                         requests=[clean for _, clean in pairs])
+    routed = [pairs[index] for index in _routed_indexes(site)]
+    kept = [(req, clean, _read(clean)) for req, clean in routed]
+    linked = follow.linked_values(clean for _, clean, read in kept if read)
+    answered = [clean.model_copy(update={"response_body": _response_body(
+        req.response_body, linked if read else frozenset())}) for req, clean, read in kept]
+    unique = {_key(req): req for req in answered}
     return site.model_copy(update={"requests": sorted(unique.values(), key=_order)})
 
 

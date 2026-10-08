@@ -320,11 +320,11 @@ def test_the_same_api_gives_the_same_bytes(tmp_path):
     second = [
         _get("/api/items?page=1", {"total": 3, "items": [{"id": 9}, {"id": 8, "sku": "q"}]}),
         {**note, "request": {**note["request"], "postData": _json_post({"text": "other"})}},
-        _get("/api/users/42", {"friends": {}, "tags": [], "name": "eve", "id": 7}),
+        _get("/api/users/42", {"friends": {}, "tags": [], "name": "eve", "id": 42}),
         page,
-        _get("/api/users/1001", {"id": 3, "name": "zed", "tags": ["c", "d", "c"],
+        _get("/api/users/1001", {"id": 1001, "name": "zed", "tags": ["c", "d", "c"],
                                  "friends": {"7": {"since": 1999}, "8": {"since": 2001}}}),
-        _get("/api/users/1001", {"id": 4, "name": "kim", "tags": ["e"],
+        _get("/api/users/1001", {"id": 1001, "name": "kim", "tags": ["e"],
                                  "friends": {"9": {"since": 2024}}}),
         note,
     ]
@@ -375,7 +375,7 @@ def test_mock_serves_the_placeholders_with_recorded_statuses_and_types(tmp_path)
                                                              "/v1/charges"))
 
     assert (user.status_code, user.headers["content-type"]) == (200, "application/json")
-    assert user.content == b'{"id":0,"name":""}'
+    assert user.content == b'{"id":1001,"name":""}'
     assert (gone.status_code, gone.headers["x-rebrowse-mock"]) == (404, "exact")
     assert (charges.status_code, charges.headers["x-rebrowse-mock"]) == (404, "miss")
 
