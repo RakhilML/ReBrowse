@@ -85,7 +85,8 @@ class Facts:
     empty: bool = False
 
 
-def _add_body(shape: Shape, text: str | None) -> None:
+def add_body(shape: Shape, text: str | None) -> None:
+    """Add the JSON in TEXT, behind any XSSI guard, to SHAPE; anything else is skipped."""
     try:
         body = json.loads(split_xssi(text or "")[1])
     except (ValueError, RecursionError):
@@ -102,7 +103,7 @@ def _facts(route: Route, requests: list[RawRequest]) -> Facts:
             facts.media.add(media)
         text = requests[rec.index].response_body
         facts.empty |= rec.status == 204 or text == ""
-        _add_body(facts.shape, text)
+        add_body(facts.shape, text)
     return facts
 
 
