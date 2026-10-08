@@ -7,11 +7,12 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import NoReturn
 
 from pydantic import ValidationError
 
 from rebrowse import config
-from rebrowse.capture.har import har_capture, read_json
+from rebrowse.capture.har import HarError, har_capture, load_hars, read_json
 from rebrowse.models import CaptureResult
 from rebrowse.reverse.extractor import registrable_domain
 
@@ -57,10 +58,49 @@ def saved_domains() -> list[str]:
     return sorted(re.sub(r"_(\d+)$", r":\1", stem) for stem in stems)
 
 
+_SKIPPED_DIRS = frozenset({"node_modules", "__MACOSX"})
+_isjunction = getattr(os.path, "isjunction", lambda path: False)
+
+
+def _unlisted(error: OSError) -> NoReturn:
+    raise HarError(f"Cannot list {error.filename}: {error.strerror}") from error
+
+
+def _walked(root: str, name: str) -> bool:
+    return not (name.startswith(".") or name in _SKIPPED_DIRS
+                or _isjunction(os.path.join(root, name)))
+
+
+def har_files(directory: Path) -> list[Path]:
+    """The .har files under DIRECTORY by POSIX relative path, skipping dot folders,
+    node_modules, __MACOSX and junctions; raises HarError if there are none."""
+    found: list[Path] = []
+    for root, dirs, names in os.walk(directory, onerror=_unlisted):
+        dirs[:] = [name for name in dirs if _walked(root, name)]
+        found += [Path(root, name) for name in names
+                  if name.lower().endswith(".har") and not name.startswith("._")]
+    if not found:
+        raise HarError(f"No .har files under {directory}")
+    return sorted(found, key=lambda path: path.relative_to(directory).as_posix())
+
+
+def read_recording(path: Path, domain: str | None = None,
+                   every_script: bool = False) -> tuple[CaptureResult, int]:
+    """Read a HAR file, a directory of them or a saved capture, and how many HAR files a
+    directory held (0 for a file); raises ValueError."""
+    if path.is_dir():
+        files = har_files(path)
+        return load_hars(files, domain, every_script), len(files)
+    return _load_file(path, domain, every_script), 0
+
+
 def load_traffic(path: str | Path, domain: str | None = None,
                  every_script: bool = False) -> CaptureResult:
-    """Read a HAR file or a saved capture; raises ValueError."""
-    path = Path(path)
+    """Read a HAR file, a directory of them or a saved capture; raises ValueError."""
+    return read_recording(Path(path), domain, every_script)[0]
+
+
+def _load_file(path: Path, domain: str | None, every_script: bool) -> CaptureResult:
     data = read_json(path)
     if isinstance(data, dict) and "log" in data:
         return har_capture(data, path, domain, every_script)

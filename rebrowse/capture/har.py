@@ -1,11 +1,12 @@
-"""Turn a HAR 1.2 export into a capture, dropping credentials as it converts."""
+"""Turn HAR 1.2 exports into a capture, dropping credentials as it converts."""
 
 from __future__ import annotations
 
 import base64
 import json
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
@@ -254,7 +255,7 @@ def _wanted(domain: str, netlocs: set[str]) -> str:
     if len(same_host) == 1:
         return same_host[0]
     seen = ", ".join(sorted(netlocs)) or "none"
-    raise HarError(f"No requests to {wanted} in the HAR (hosts seen: {seen})")
+    raise HarError(f"No requests to {wanted} in the recording (hosts seen: {seen})")
 
 
 def _site(requests: list[RawRequest], urls: list[str], domain: str | None) -> tuple[str, str]:
@@ -268,8 +269,39 @@ def _site(requests: list[RawRequest], urls: list[str], domain: str | None) -> tu
         domain = _netloc((documents or urls or [""])[0])
     on_site = [u for u in urls if _netloc(u) == domain]
     if not on_site:
-        raise HarError("No http(s) requests in the HAR")
+        raise HarError("No http(s) requests in the recording")
     return domain, next((u for u in documents if _netloc(u) == domain), on_site[0])
+
+
+@dataclass
+class _Traffic:
+    requests: list[RawRequest] = field(default_factory=list)
+    scripts: dict[str, str] = field(default_factory=dict)
+    urls: list[str] = field(default_factory=list)
+
+
+def _convert(traffic: _Traffic, data: Any, path: Path, every_script: bool) -> None:
+    """Add the entries of one HAR to TRAFFIC; a script URL seen before keeps its first text."""
+    for url, request, response in _exchanges(_entries(data, path)):
+        traffic.urls.append(url)
+        content_type = _content_type(response)
+        if _is_script(url, content_type):
+            text = _text(_content(response))
+            if text and (every_script or len(text) < config.MAX_BUNDLE_CHARS):
+                traffic.scripts.setdefault(url, text)
+            continue
+        try:
+            traffic.requests.append(_raw_request(url, request, response, content_type))
+        except RecursionError:
+            continue
+
+
+def _assemble(traffic: _Traffic, domain: str | None, every_script: bool) -> CaptureResult:
+    domain, final_url = _site(traffic.requests, traffic.urls, domain)
+    same_site = [(url, text) for url, text in traffic.scripts.items() if _same_site(url, domain)]
+    bundles = dict(same_site if every_script else same_site[:config.MAX_JS_BUNDLES])
+    return CaptureResult(requests=traffic.requests, domain=domain, final_url=final_url,
+                         js_bundles=bundles)
 
 
 def load_har(path: str | Path, domain: str | None = None) -> CaptureResult:
@@ -279,22 +311,15 @@ def load_har(path: str | Path, domain: str | None = None) -> CaptureResult:
 def har_capture(data: Any, path: Path, domain: str | None = None,
                 every_script: bool = False) -> CaptureResult:
     """EVERY_SCRIPT keeps all same-site scripts, past MAX_JS_BUNDLES and MAX_BUNDLE_CHARS."""
-    requests: list[RawRequest] = []
-    scripts: dict[str, str] = {}
-    urls: list[str] = []
-    for url, request, response in _exchanges(_entries(data, path)):
-        urls.append(url)
-        content_type = _content_type(response)
-        if _is_script(url, content_type):
-            text = _text(_content(response))
-            if text and (every_script or len(text) < config.MAX_BUNDLE_CHARS):
-                scripts.setdefault(url, text)
-            continue
-        try:
-            requests.append(_raw_request(url, request, response, content_type))
-        except RecursionError:
-            continue
-    domain, final_url = _site(requests, urls, domain)
-    same_site = [(url, text) for url, text in scripts.items() if _same_site(url, domain)]
-    bundles = dict(same_site if every_script else same_site[:config.MAX_JS_BUNDLES])
-    return CaptureResult(requests=requests, domain=domain, final_url=final_url, js_bundles=bundles)
+    traffic = _Traffic()
+    _convert(traffic, data, path, every_script)
+    return _assemble(traffic, domain, every_script)
+
+
+def load_hars(paths: Iterable[Path], domain: str | None = None,
+              every_script: bool = False) -> CaptureResult:
+    """Read the HAR files at PATHS, one at a time and in order, as one recording."""
+    traffic = _Traffic()
+    for path in paths:
+        _convert(traffic, read_json(path), path, every_script)
+    return _assemble(traffic, domain, every_script)
