@@ -123,11 +123,11 @@ async def test_query_api_key(fixture_site):
 
 
 async def test_per_host_pacing(fixture_site, monkeypatch):
-    interval = 0.05
+    interval = 0.2
     monkeypatch.setattr(config, "HOST_MIN_INTERVAL_S", interval)
     executor._last_request_at.clear()
     ep = EndpointDescriptor(method=HttpMethod.GET, url_template=f"{fixture_site}/api/items")
     start = time.monotonic()
     for _ in range(3):
         await execute_endpoint(_skill(), ep)
-    assert time.monotonic() - start >= 2 * interval
+    assert time.monotonic() - start >= 2 * interval - 0.05
