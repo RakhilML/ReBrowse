@@ -48,7 +48,7 @@ rebrowse openapi api-baseline.json -o api.json     # ... from a recording, no LL
 rebrowse mock e2e.har [-p 8787]                    # serve the recorded API on 127.0.0.1
 rebrowse baseline e2e.har -o api-baseline.json     # a recording that is safe to commit
 rebrowse diff api-baseline.json e2e.har            # API changes that break the client
-rebrowse contract api-baseline.json --against http://localhost:8000  # replay reads
+rebrowse contract api-baseline.json --against http://localhost:8000 --follow-ids  # replay reads
 rebrowse diff api-baseline.json e2e.har --accepted diff-accepted.json  # reviewed breaks pass
 rebrowse coverage e2e.har --fail-under 80          # API calls in the JS the recording missed
 rebrowse skills [-q "search"]  |  rebrowse show <id>  |  rebrowse delete <id>
@@ -332,8 +332,8 @@ skill, and nothing is stored. SOURCE is read as `mock` reads it, and ORIGIN is
 # frontend, once: record the e2e run with browser.new_context(record_har_path="e2e.har"),
 # write `rebrowse baseline e2e.har -o api-baseline.json` and commit that file next to the
 # backend, never the HAR. Backend CI, on every pull request:
-docker compose up -d --wait api && ./scripts/seed-fixtures.sh   # the data the recording saw
-REBROWSE_HOST_INTERVAL=0 rebrowse contract api-baseline.json --against http://api:8000
+docker compose up -d --wait api    # seeded with a few fixtures of its own
+REBROWSE_HOST_INTERVAL=0 rebrowse contract api-baseline.json --against http://api:8000 --follow-ids
 # exit 0: compatible, 1: breaking change or failed replay,
 # 2: bad input, no answer at all, or every read refused or redirected
 ```
@@ -344,8 +344,9 @@ REBROWSE_HOST_INTERVAL=0 rebrowse contract api-baseline.json --against http://ap
   (`/ajax.php?action=delete`) makes the call a write. Writes, destructive calls, routes
   recorded only as 304, event streams, and calls with a credential-like path segment (a JWT)
   are listed under `skipped` with the reason, and never sent; there is no `--yes`. Each route gets at most three
-  distinct recorded requests, one at a time, in recorded order, with no retries and no
-  redirects followed, so a route that now redirects to `/login` is compared as a 302.
+  distinct recorded requests, one at a time, in recorded order (sources first with
+  `--follow-ids`), with no retries and no redirects followed, so a route that now redirects
+  to `/login` is compared as a 302.
   Recorded calls to sibling hosts, such as `api.app.com` next to `app.com`, are skipped;
   `--domain api.app.com` picks the host under test, in a HAR or in a saved capture of
   `www.app.com`. Requests to a host other than localhost are paced like `verify`
@@ -395,6 +396,30 @@ REBROWSE_HOST_INTERVAL=0 rebrowse contract api-baseline.json --against http://ap
   rebrowse contract api-baseline.json --against http://api:8000 \
     --header-env Authorization=CI_API_TOKEN --header-env X-Tenant=CI_TENANT
   ```
+- **Ids from ORIGIN's own answers.** A recording made against staging asks for staging's
+  rows: `/api/orders/81723`, `?userId=4410`, a GraphQL `Order($id)` variable. A CI backend
+  seeded with its own fixtures answers 404 or `null` to each, and every detail route reads as
+  a breaking `status` change. `--follow-ids` works out, from the recording alone, which
+  earlier read's answer held each id: the `GET /api/orders` whose `$.orders[1].id` was 81723.
+  It sends that read to ORIGIN first and sends the id ORIGIN's answer holds at the same
+  place, or at the same place in the first item when ORIGIN's list is shorter. Ids are taken
+  from templated path segments, id-named query parameters (`userId`, `order_id`) and id-named
+  JSON body fields such as GraphQL variables (`$.variables.id`); an answer field counts only
+  under an id-named key (`id`, `ids`, `uuid`, `...Id`, `..._id`), never a secret-named one.
+  When the same id is in several answers, as small seeded ids often are, it is taken from the
+  bare id of what it names (`$.products[1].id`, or the `$.id` of `/api/products/42`, for
+  `/api/products/{products_id}`), then from a read that sends fewer ids of its own, then from
+  a key named for it (`user_id` for `?userId=`) before a key named for something else
+  (`productId`), whatever the order of the recording. Only reads are followed, since writes are never sent, and a read whose id ORIGIN does not
+  answer (the source failed, holds no value there, or holds one that is not a plain id) is
+  never sent with a guessed or recorded id: its route is listed under `skipped` as `id not
+  found on target`. A rewritten request must still be a read of the same route, so a value
+  such as `../admin` or `delete-all` is never sent, and values from ORIGIN go only back to
+  ORIGIN. The report gains `followed`, one row per traced id with the route, where the id is
+  sent (`path`, `query` or `body`), its name, the route it came from and the field, never a
+  value. Without the flag, a run where such a read answers 404 or 410 says so on stderr; with
+  it, a baseline written by an older rebrowse, which keeps no ids in answers, gets a note to
+  write it again.
 - **Judging.** Each request is sent once, and its live answer is compared with every recorded
   answer to that same request (method, URL and body), so the order of the recording never
   changes the verdict: a list loaded before and after a create is judged against the fields of
@@ -424,19 +449,22 @@ REBROWSE_HOST_INTERVAL=0 rebrowse contract api-baseline.json --against http://ap
   of dozens of breaking changes, and `--update-accepted` never writes. When only some requests
   are refused, each one is still a breaking `status` change, and `--update-accepted` leaves
   such changes for you to add by hand, so a half-expired session cannot be accepted either.
-- **Caveats.** The recorded ids must exist on ORIGIN: seed it with the fixtures the recording
-  was made against, otherwise `/api/orders/1001` answers 404 and is reported as a breaking
-  status change. A field counts as required when every replayed recording carries it, so an
-  optional field that ORIGIN leaves out for differently seeded data is reported as removed.
+- **Caveats.** Without `--follow-ids`, the recorded ids must exist on ORIGIN, otherwise
+  `/api/orders/1001` answers 404 and is reported as a breaking status change. With it, an id
+  that no replayed read's answer held, such as one in the page URL, a header, a write's answer
+  or a GraphQL literal (`user(id: 1001)`), is still sent as recorded. A field counts as
+  required when every replayed recording carries it, so an optional field that ORIGIN leaves
+  out for differently seeded data is reported as removed.
   Only reads are ever replayed, so changes to writes go untested. Secret-named values are
   sent redacted, so a call that needs one (`pageToken`, a `sessionId` variable) usually
   answers 400 and is reported as broken.
 
 The report is JSON on stdout: the source, domain and target; the `--header-env` header
 names, as `credentials`, when any were given; how many routes were replayed,
-how many requests were sent and answered; the skipped routes; the number of breaking changes;
-and the changes ordered by route. Like `diff`, it holds route names, statuses, media types,
-field paths and JSON type names, plus transport error text, never a recorded or live value:
+how many requests were sent and answered; with `--follow-ids`, the ids followed; the skipped
+routes; the number of breaking changes; and the changes ordered by route. Like `diff`, it
+holds route names, statuses, media types, field paths and JSON type names, plus transport
+error text, never a recorded or live value:
 
 ```json
 {"severity": "breaking", "kind": "no_response", "route": "GET /api/summary",
@@ -557,12 +585,19 @@ Nothing is sent over the network.
   secret-named arguments in a GraphQL document (`login(password: "...")`), are redacted as
   `contract` redacts them. Every response header but `content-type`, so `Set-Cookie` and
   `Location`, is dropped. Every response value becomes a placeholder of its JSON type (`""`,
-  `0`, `0.5`, `false`, `null`); keys that `diff` reads as values (ids, emails, dates, tokens)
-  become `"0"`, `"1"`, ...; HTML, XML, text and JSONP bodies are dropped. Write bodies keep
-  only the `operationName` and `query` strings and the `extensions` object of each GraphQL
-  operation, with secret-named values redacted, and turn every other JSON value into a
-  placeholder; a form-encoded GraphQL write keeps the same three fields, and other form,
-  multipart and XML write bodies are dropped. In the document of a named or
+  `0`, `0.5`, `false`, `null`), except, in the answer to a read, a value that a kept read
+  sends as an id (a templated path segment, an id-named query value or JSON body field) and
+  that sits under an id-named key that is not secret-named, where `contract --follow-ids`
+  looks: `$.items[1].id` keeps `1002` when `/api/items/1002` is in the file, while a `count`
+  or `total` of 1002, or an id under a key that `diff` reads as a value, stays a placeholder.
+  That value is already in the file, in the request that sends it; only its place is added,
+  and answers that differ only in other values give the same file. Answers to writes keep
+  no value. Keys that `diff` reads as values (ids, emails,
+  dates, tokens) become `"0"`, `"1"`, ...; HTML, XML, text and JSONP bodies are dropped.
+  Write bodies keep only the `operationName` and `query` strings and the `extensions` object
+  of each GraphQL operation, with secret-named values redacted, and turn every other JSON
+  value into a placeholder; a form-encoded GraphQL write keeps the same three fields, and
+  other form, multipart and XML write bodies are dropped. In the document of a named or
   persisted write, every number becomes `0` and every string and comment keeps only the words
   that classify the call, a destructive verb or `mutation` (`bulk(action: "delete", note: "")`),
   so its effect is the same as recorded. Calls that `diff` does not compare, such as the site
@@ -575,7 +610,8 @@ Nothing is sent over the network.
   its recorded answers, whatever their order, so it sends the same requests and reaches the
   same judgement whenever no route has more than three distinct recorded reads; past that it
   replays the first three in the baseline's sorted order. `mock` serves the placeholders with
-  the recorded status and `content-type`.
+  the recorded status and `content-type`, and a list's kept ids match the detail routes it
+  serves.
 - **Stable.** Requests are deduplicated and sorted, as are keys and array items, and no time,
   trace id or cache-buster is written, so recording the same calls against an unchanged API
   gives the same bytes and the pull-request diff of `api-baseline.json` reads as the API

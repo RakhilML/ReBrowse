@@ -392,9 +392,16 @@ def diff(base: str, head: str, domains: tuple[str, ...], accepted: Path | None,
                    "headers cannot be set.")
 @click.option("--domain", "-d", default=None, metavar="HOST[:PORT]",
               help="Site to test in a HAR (default: host of the first HTML page).")
+@click.option("--follow-ids", "follow_ids", is_flag=True,
+              help="Send each recorded id that another replayed read's answer held as the id "
+                   "ORIGIN's answer to that read holds at the same place, so the recording's "
+                   "data need not exist on ORIGIN. Ids are taken from path segments, id-named "
+                   "query parameters and id-named JSON body fields (GraphQL variables). A read "
+                   "whose id ORIGIN does not answer is skipped, never sent with a guessed "
+                   "value. Values are never printed.")
 @_accepted_options
 def contract(source: str, against: str, header_env: tuple[str, ...], domain: str | None,
-             accepted: Path | None, update_accepted: bool):
+             follow_ids: bool, accepted: Path | None, update_accepted: bool):
     """Replay the reads recorded in SOURCE against ORIGIN and report what breaks the client.
 
     SOURCE is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
@@ -408,7 +415,14 @@ def contract(source: str, against: str, header_env: tuple[str, ...], domain: str
     replay failed, and 2 on bad input or FILE, no reads to replay, when ORIGIN never
     answered, or when it refused or redirected every read the recording answered.
     """
-    from rebrowse.contract import BLOCKED, NO_RESPONSE, env_headers, parse_target, run_contract
+    from rebrowse.contract import (
+        BLOCKED,
+        ID_NOT_FOUND,
+        NO_RESPONSE,
+        check,
+        env_headers,
+        parse_target,
+    )
 
     try:
         target = parse_target(against)
@@ -425,10 +439,22 @@ def contract(source: str, against: str, header_env: tuple[str, ...], domain: str
         _emit({"error": str(e)}, error_code=2)
         return
     variables = dict(spec.split("=", 1) for spec in header_env)
-    report = asyncio.run(run_contract(capture, target, headers, variables))
+    outcome = asyncio.run(check(capture, target, headers, variables, follow_ids))
+    report = outcome.report
     if "error" in report:
         _emit(report, error_code=2)
         return
+    if outcome.unlinked:
+        click.echo("[contract] --follow-ids found no recorded id in another read's answer; if "
+                   "SOURCE is a baseline written by an older rebrowse, write it again with "
+                   "'rebrowse baseline'", err=True)
+    if missing := sum(row["reason"] == ID_NOT_FOUND for row in report["skipped"]):
+        click.echo(f"[contract] {_count(missing, 'route', 'routes')} skipped: id not found on "
+                   "target", err=True)
+    if outcome.unfollowed:
+        click.echo(f"[contract] {_count(outcome.unfollowed, 'route', 'routes')} answered 404 or "
+                   "410 for ids taken from recorded answers; --follow-ids takes them from "
+                   "ORIGIN's own answers", err=True)
     report = {"source": str(path.resolve()), **report}
     uncompared = {row["route"] for row in report["skipped"]} | {
         change["route"] for change in report["changes"]
@@ -452,7 +478,9 @@ def baseline(source: str, domain: str | None, out: Path | None):
     Credentials are removed as contract removes them before sending, every response value
     becomes a placeholder of the same JSON type, and requests are sorted and deduplicated,
     so the file is the same for the same API. Request paths, query values and the bodies of
-    reads are kept, since contract replays them. Nothing is sent over the network.
+    reads are kept, since contract replays them, and so is a response value under an
+    id-named key equal to an id a kept read sends, so contract --follow-ids can tell which
+    answer held it. Nothing is sent over the network.
     """
     from rebrowse.baseline import baseline_bytes, make_baseline, write_baseline
     from rebrowse.mock import build_routes

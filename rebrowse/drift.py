@@ -120,7 +120,7 @@ def _types(node: Shape | None) -> list[str] | None:
     return sorted(node.types) if node else None
 
 
-def _path(parent: str, name: str) -> str:
+def field_path(parent: str, name: str) -> str:
     if _IDENTIFIER.fullmatch(name):
         return f"{parent}.{name}"
     return f"{parent}[{json.dumps(name, ensure_ascii=False)}]"
@@ -133,7 +133,7 @@ def _compare_shapes(base: Shape, head: Shape, path: str) -> Iterator[FieldChange
         yield INFO if widened else BREAKING, "field_type", path, _types(base), _types(head)
     if base.objects and head.objects:
         for name in sorted(base.fields.keys() | head.fields.keys()):
-            yield from _compare_field(base, head, name, _path(path, name))
+            yield from _compare_field(base, head, name, field_path(path, name))
     if base.entries and head.entries:
         yield from _compare_shapes(base.entries, head.entries, path + ".*")
     if base.items and head.items:

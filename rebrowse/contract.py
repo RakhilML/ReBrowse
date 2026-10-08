@@ -8,12 +8,12 @@ from collections import Counter
 from collections.abc import Iterable, Mapping
 from http import HTTPStatus
 from itertools import islice
-from typing import NamedTuple
-from urllib.parse import parse_qsl, urlencode, urlsplit
+from typing import Any, NamedTuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit
 
 import httpx
 
-from rebrowse import config, drift, net
+from rebrowse import config, drift, follow, net
 from rebrowse.auth.vault import get_api_key
 from rebrowse.capture.har import (
     HEADER_NAME,
@@ -25,8 +25,13 @@ from rebrowse.capture.har import (
 from rebrowse.execution import executor
 from rebrowse.mock import LOOPBACK, Recording, Route, build_routes
 from rebrowse.models import CaptureResult, RawRequest
-from rebrowse.reverse.extractor import is_api_request
-from rebrowse.reverse.graphql import request_effect
+from rebrowse.reverse.extractor import (
+    canonical_template,
+    is_api_request,
+    normalize_url,
+    parse_body,
+)
+from rebrowse.reverse.graphql import graphql_ops, request_effect
 from rebrowse.safety import Effect, redact_body
 
 MAX_REPLAYS_PER_ROUTE = 3
@@ -34,6 +39,8 @@ DEADLINE_FACTOR = 3
 NO_RESPONSE, BLOCKED = "no_response", "blocked"
 NON_API = "answered with a non-API response"
 UNREPLAYABLE = "unreplayable"
+ID_NOT_FOUND = "id not found on target"
+_GONE = (404, 410)
 _RECEIVED = ("content-encoding", "content-length", "transfer-encoding")
 RESERVED_HEADERS = frozenset({
     "host", "user-agent", "content-length", "transfer-encoding", "connection", "keep-alive",
@@ -45,12 +52,22 @@ class Replay(NamedTuple):
     route: Route
     recordings: list[RawRequest]
     request: httpx.Request
+    sent: RawRequest
 
 
 class Failure(NamedTuple):
     route: str
     kind: str
     error: str
+
+
+class Outcome(NamedTuple):
+    """A report, how many routes answered 404 or 410 for an id from a recorded answer, and
+    whether --follow-ids linked nothing although some read sends an id."""
+
+    report: dict
+    unfollowed: int
+    unlinked: bool = False
 
 
 Answer = tuple[Replay, RawRequest]
@@ -138,10 +155,17 @@ def _build(req: RawRequest, target: str, headers: Mapping[str, str]) -> httpx.Re
         return None
 
 
+def _replay(route: Route, group: list[RawRequest], target: str,
+            headers: Mapping[str, str]) -> Replay | None:
+    recorded = _sent_from(group)
+    request, sent = _build(recorded, target, headers), sent_request(recorded)
+    return None if request is None or sent is None else Replay(route, group, request, sent)
+
+
 def _picks(route: Route, candidates: list[list[RawRequest]], target: str,
            headers: Mapping[str, str]) -> list[Replay]:
-    built = (Replay(route, group, request) for group in candidates
-             if (request := _build(_sent_from(group), target, headers)) is not None)
+    built = (replay for group in candidates
+             if (replay := _replay(route, group, target, headers)) is not None)
     return list(islice(built, MAX_REPLAYS_PER_ROUTE))
 
 
@@ -184,13 +208,24 @@ def _replaced(headers: dict[str, str], given: Mapping[str, str]) -> dict[str, st
     return {**{k: v for k, v in headers.items() if k.lower() not in names}, **given}
 
 
+def sent_request(req: RawRequest) -> RawRequest | None:
+    """REQ with the URL and body a replay sends, or None for a URL that is never sent."""
+    url = scrub_url(req.url)
+    if url is None:
+        return None
+    body = None
+    if req.method != "GET" and req.request_body is not None:
+        body = redact_body(req.request_body, content_type_of(req.request_headers))
+    return req.model_copy(update={"url": url, "request_body": body})
+
+
 def replay_request(req: RawRequest, target: str,
                    headers: Mapping[str, str] | None = None) -> httpx.Request:
     """Raises httpx.InvalidURL or ValueError for a recording that cannot be sent."""
-    recorded = scrub_url(req.url)
-    if recorded is None:
+    clean = sent_request(req)
+    if clean is None:
         raise ValueError("the recorded URL is not an http(s) URL without a credential")
-    parts = urlsplit(recorded)
+    parts = urlsplit(clean.url)
     sent = _headers(req.request_headers)
     key_query: dict[str, str] = {}
     if key := _target_key(target):
@@ -198,10 +233,7 @@ def replay_request(req: RawRequest, target: str,
     sent = _replaced(sent, headers or {})
     query = _query(parts.query, key_query)
     url = f"{target}{parts.path or '/'}" + (f"?{query}" if query else "")
-    body = None
-    if req.method != "GET" and req.request_body is not None:
-        body = redact_body(req.request_body, content_type_of(req.request_headers))
-    return httpx.Request(req.method, url, headers=sent, content=body)
+    return httpx.Request(req.method, url, headers=sent, content=clean.request_body)
 
 
 def _live(req: RawRequest, resp: httpx.Response) -> RawRequest:
@@ -239,34 +271,81 @@ async def _fetch(client: httpx.AsyncClient, request: httpx.Request) -> httpx.Res
                           request=request)
 
 
+async def _exchange(client: httpx.AsyncClient, host: str, replay: Replay,
+                    request: httpx.Request) -> tuple[bool, RawRequest | Failure]:
+    """Whether ORIGIN answered REQUEST, and its live answer or the failure."""
+    if host not in LOOPBACK:
+        await executor.pace(host)
+    try:
+        resp = await _fetch(client, request)
+    except httpx.HTTPError as e:
+        return False, Failure(replay.route.name, NO_RESPONSE, f"{type(e).__name__}: {e}")
+    except TimeoutError:
+        deadline = executor.TIMEOUT_S * DEADLINE_FACTOR
+        return False, Failure(replay.route.name, NO_RESPONSE,
+                              f"TimeoutError: no complete answer within {deadline:g}s")
+    return True, _judge(replay, resp)
+
+
+def _route_key(req: RawRequest) -> tuple:
+    parts = urlparse(req.url)
+    ops = graphql_ops(parse_body(req.request_body), dict(parse_qsl(parts.query)))
+    template = canonical_template(urlparse(normalize_url(req.url)[0]).path)
+    return req.method, parts.netloc, template, tuple(op.dedup_token() for op in ops)
+
+
+def _same_route(rewritten: RawRequest, recorded: RawRequest,
+                values: Iterable[follow.Position]) -> bool:
+    """Whether REWRITTEN, its followed path ids taken as placeholders, keys RECORDED's route."""
+    holes = {position: "{}" for position in values if position.where == follow.PATH}
+    return _route_key(follow.rewrite(rewritten, holes)) == _route_key(recorded)
+
+
+def _followed_request(replay: Replay, links: list[follow.Link], bodies: Mapping[int, Any],
+                      target: str, headers: Mapping[str, str]) -> httpx.Request | None:
+    """REPLAY sending the ids ORIGIN answered, if each is safe and it still reads its route."""
+    values: dict[follow.Position, str | int] = {}
+    for link in links:
+        if (value := follow.resolve(link, bodies.get(link.source))) is None:
+            return None
+        values[link.position] = value
+    rewritten = follow.rewrite(replay.sent, values)
+    if (scrubbed := sent_request(rewritten)) is None or scrubbed.url != rewritten.url:
+        return None
+    effect = request_effect(rewritten.method, rewritten.url, parse_body(rewritten.request_body))
+    if effect is not Effect.READ or not _same_route(rewritten, replay.sent, values):
+        return None
+    return _build(rewritten, target, headers)
+
+
 async def _replay_all(
-    replays: list[Replay], target: str,
-) -> tuple[list[Answer], list[Failure], int]:
+    replays: list[Replay], order: list[int], links: list[follow.Link], target: str,
+    headers: Mapping[str, str],
+) -> tuple[dict[int, RawRequest | Failure], int]:
+    """The outcome of each replay sent, in ORDER, and how many of them ORIGIN answered."""
     host = urlsplit(target).hostname or ""
-    answers: list[Answer] = []
-    failed: list[Failure] = []
+    needs: dict[int, list[follow.Link]] = {}
+    for link in links:
+        needs.setdefault(link.dependent, []).append(link)
+    sources = {link.source for link in links}
+    bodies: dict[int, Any] = {}
+    outcomes: dict[int, RawRequest | Failure] = {}
     answered = 0
     async with net.client(executor.TIMEOUT_S, follow_redirects=False) as client:
-        for replay in replays:
-            if host not in LOOPBACK:
-                await executor.pace(host)
-            try:
-                resp = await _fetch(client, replay.request)
-            except httpx.HTTPError as e:
-                failed.append(Failure(replay.route.name, NO_RESPONSE, f"{type(e).__name__}: {e}"))
+        for index in order:
+            replay = replays[index]
+            request = replay.request
+            if index in needs:
+                request = _followed_request(replay, needs[index], bodies, target, headers)
+            if request is None:
                 continue
-            except TimeoutError:
-                deadline = executor.TIMEOUT_S * DEADLINE_FACTOR
-                failed.append(Failure(replay.route.name, NO_RESPONSE,
-                                      f"TimeoutError: no complete answer within {deadline:g}s"))
-                continue
-            answered += 1
-            outcome = _judge(replay, resp)
-            if isinstance(outcome, Failure):
-                failed.append(outcome)
-            else:
-                answers.append((replay, outcome))
-    return answers, failed, answered
+            got, outcome = await _exchange(client, host, replay, request)
+            answered += got
+            outcomes[index] = outcome
+            if (index in sources and isinstance(outcome, RawRequest)
+                    and 200 <= outcome.response_status < 300):
+                bodies[index] = follow.json_answer(outcome.response_body)
+    return outcomes, answered
 
 
 def _failures(failed: list[Failure]) -> list[dict]:
@@ -360,9 +439,34 @@ def _refused_error(target: str, refused: Counter[int], headers: Mapping[str, str
             "or belong to another environment, or check ORIGIN's scheme and host")
 
 
-async def run_contract(capture: CaptureResult, target: str,
-                       headers: Mapping[str, str] | None = None,
-                       variables: Mapping[str, str] | None = None) -> dict:
+def _followed_rows(replays: list[Replay], links: list[follow.Link]) -> list[dict]:
+    rows = {(replays[link.dependent].route.name, link.position.where, link.position.name,
+             replays[link.source].route.name, link.field) for link in links}
+    return [dict(zip(("route", "in", "name", "from", "field"), row)) for row in sorted(rows)]
+
+
+def _not_found(replays: list[Replay], sent: set[str]) -> list[dict]:
+    unsent = {replay.route.name for replay in replays} - sent
+    return [{"route": route, "reason": ID_NOT_FOUND} for route in sorted(unsent)]
+
+
+def _reads(replays: list[Replay]) -> list[follow.Read]:
+    return [follow.Read(replay.route.name, replay.sent, replay.recordings) for replay in replays]
+
+
+def _unfollowed(replays: list[Replay], outcomes: Mapping[int, RawRequest | Failure]) -> int:
+    """Routes whose read of an id another read's recorded answer held now answers 404 or 410."""
+    gone = {index for index, live in outcomes.items()
+            if isinstance(live, RawRequest) and live.response_status in _GONE
+            and drift.answers({req.response_status for req in replays[index].recordings})}
+    if not gone:
+        return 0
+    dependents = {link.dependent for link in follow.link(_reads(replays))[0]}
+    return len({replays[index].route.name for index in gone & dependents})
+
+
+async def check(capture: CaptureResult, target: str, headers: Mapping[str, str] | None = None,
+                variables: Mapping[str, str] | None = None, follow_ids: bool = False) -> Outcome:
     """VARIABLES names the environment variable each of HEADERS was read from, for errors."""
     headers = headers or {}
     replays, skipped = plan(capture, target, headers)
@@ -370,23 +474,41 @@ async def run_contract(capture: CaptureResult, target: str,
         reasons = Counter(row["reason"] for row in skipped)
         why = ", ".join(f"{count} {reason}" for reason, count in sorted(reasons.items()))
         hint = "; pass --domain for another host" if reasons["other host"] else ""
-        return {"error": f"No recorded read API calls to replay for {capture.domain}"
-                         + (f" (skipped: {why}{hint})" if why else "")}
-    answers, failed, answered = await _replay_all(replays, target)
+        return Outcome({"error": f"No recorded read API calls to replay for {capture.domain}"
+                                 + (f" (skipped: {why}{hint})" if why else "")}, 0)
+    links, order = follow.link(_reads(replays)) if follow_ids else ([], list(range(len(replays))))
+    outcomes, answered = await _replay_all(replays, order, links, target, headers)
+    answers = [(replays[index], live) for index, live in outcomes.items()
+               if isinstance(live, RawRequest)]
+    failed = [failure for failure in outcomes.values() if isinstance(failure, Failure)]
     if not answered:
-        return {"error": f"No response from {target}: {failed[0].error}"}
+        return Outcome({"error": f"No response from {target}: {failed[0].error}"}, 0)
     if refused := _refusals(answers):
-        return {"error": _refused_error(target, refused, headers, variables or {})}
+        return Outcome({"error": _refused_error(target, refused, headers, variables or {})}, 0)
     changes = _changes(capture, answers, failed)
     credentials = {"credentials": sorted(name.lower() for name in headers)} if headers else {}
-    return {
+    followed = {"followed": _followed_rows(replays, links)} if follow_ids else {}
+    sent = {replays[index].route.name for index in outcomes}
+    report = {
         "domain": capture.domain,
         "target": target,
         **credentials,
-        "routes": len({replay.route.name for replay in replays}),
-        "replayed": len(replays),
+        "routes": len(sent),
+        "replayed": len(outcomes),
         "answered": answered,
-        "skipped": skipped,
+        **followed,
+        "skipped": skipped + _not_found(replays, sent),
         "breaking": sum(change["severity"] == drift.BREAKING for change in changes),
         "changes": changes,
     }
+    if not follow_ids:
+        return Outcome(report, _unfollowed(replays, outcomes))
+    unlinked = not links and any(follow.positions(replay.sent) for replay in replays)
+    return Outcome(report, 0, unlinked)
+
+
+async def run_contract(capture: CaptureResult, target: str,
+                       headers: Mapping[str, str] | None = None,
+                       variables: Mapping[str, str] | None = None,
+                       follow_ids: bool = False) -> dict:
+    return (await check(capture, target, headers, variables, follow_ids)).report
