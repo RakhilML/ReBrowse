@@ -13,7 +13,6 @@ from rebrowse import drift, follow
 from rebrowse.capture.har import (
     clean_url,
     content_type_of,
-    credential_in_path,
     scrub_url,
     sendable_headers,
 )
@@ -89,10 +88,10 @@ def _write_url(url: str) -> str:
     return urlunsplit(parts._replace(query=query))
 
 
-def _page_url(url: str) -> str:
-    page = (clean_url(url) or "").partition("?")[0]
-    if not credential_in_path(page):
-        return page
+def _site_root(url: str) -> str:
+    """The page a run opened first is not part of the API, so only its origin is kept."""
+    if not (page := clean_url(url)):
+        return ""
     parts = urlsplit(page)
     return f"{parts.scheme}://{parts.netloc}/"
 
@@ -198,7 +197,7 @@ def _order(req: RawRequest) -> tuple:
 def make_baseline(capture: CaptureResult) -> CaptureResult:
     """The calls diff, contract and mock judge, without credentials or values but sent ids."""
     pairs = [(req, clean) for req in _routed(capture) if (clean := _scrub(req)) is not None]
-    site = CaptureResult(domain=capture.domain, final_url=_page_url(capture.final_url),
+    site = CaptureResult(domain=capture.domain, final_url=_site_root(capture.final_url),
                          requests=[clean for _, clean in pairs])
     routed = [pairs[index] for index in _routed_indexes(site)]
     kept = [(req, clean, _read(clean)) for req, clean in routed]

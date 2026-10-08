@@ -181,7 +181,7 @@ def test_a_saved_capture_of_another_site_is_an_error(tmp_path):
     assert not out.exists()
 
 
-def test_the_page_url_keeps_no_query_userinfo_or_fragment(tmp_path):
+def test_the_page_url_becomes_the_site_root(tmp_path):
     har = _write(tmp_path, [
         _entry("GET", "https://ann:SECRET@app.example.com/home?invite=SECRET#SECRET",
                mime="text/html", body="<html></html>"),
@@ -191,7 +191,7 @@ def test_the_page_url_keeps_no_query_userinfo_or_fragment(tmp_path):
 
     _cli("baseline", str(har), "-o", str(out))
 
-    assert load_traffic(out).final_url == f"{SITE}/home"
+    assert load_traffic(out).final_url == f"{SITE}/"
 
 
 def test_stdout_and_out_write_the_same_utf8_bytes(tmp_path):
