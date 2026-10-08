@@ -825,3 +825,22 @@ def test_an_outage_stops_contract_from_rewriting_the_file(tmp_path, fixture_site
 def test_base_and_head_match_as_json_not_as_python_values():
     entry = {"kind": "status", "route": "GET /a", "base": [200], "head": [True]}
     assert not matches(entry, {**STATUS, "head": [1]})
+
+
+def test_answers_turning_into_refusals_are_never_accepted_automatically(tmp_path):
+    with _running(_scripted({
+        "/api/search": (200, "application/json", json.dumps(RESULTS).encode()),
+        "/api/admin": (403, "application/json", b'{"error": "forbidden"}'),
+    })) as origin:
+        har = _write(tmp_path, [_page(), _get("/api/search", RESULTS),
+                                _get("/api/admin", {"ok": True})])
+        file = tmp_path / "accepted.json"
+        result = _cli("contract", str(har), "--against", origin, "--accepted", str(file),
+                      "--update-accepted")
+
+    report = json.loads(result.stdout)
+    assert result.exit_code == 1 and json.loads(file.read_text(encoding="utf-8")) == []
+    assert [(c["kind"], c["severity"]) for c in report["changes"]] == [("status", "breaking")]
+    assert "not accepting 1 change from an answer to a sign-in redirect" in result.stderr
+    by_hand = {"kind": "status", "route": "GET /api/admin", "reason": "admin now needs a role"}
+    assert matches(by_hand, report["changes"][0])

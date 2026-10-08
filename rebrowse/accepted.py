@@ -37,6 +37,16 @@ def unsettled(change: dict) -> bool:
         and _server_error(change.get("head")))
 
 
+def needs_review(change: dict) -> bool:
+    """A request that answered and is now refused or redirected: accepted by hand only."""
+    if change.get("kind") != "status" or change.get("severity") != BREAKING:
+        return False
+    base, head = change.get("base") or [], change.get("head") or []
+    answered = any(isinstance(s, int) and (200 <= s < 300 or s == 304) for s in base)
+    return answered and any(isinstance(s, int) and (s in (401, 403) or 300 <= s < 400)
+                            and s != 304 for s in head)
+
+
 def _problem(entry: Any) -> str | None:
     if not isinstance(entry, dict):
         return "not an object"
@@ -120,7 +130,8 @@ def update_accepted(
     updated = [entry for entry in entries if entry["route"] in uncompared
                or any(matches(entry, change) for change in changes)]
     for change in changes:
-        if _acceptable(change) and not any(matches(entry, change) for entry in updated):
+        if (_acceptable(change) and not needs_review(change)
+                and not any(matches(entry, change) for entry in updated)):
             updated.append(_identity(change))
     return updated
 
