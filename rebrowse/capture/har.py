@@ -276,7 +276,9 @@ def load_har(path: str | Path, domain: str | None = None) -> CaptureResult:
     return har_capture(read_json(Path(path)), Path(path), domain)
 
 
-def har_capture(data: Any, path: Path, domain: str | None = None) -> CaptureResult:
+def har_capture(data: Any, path: Path, domain: str | None = None,
+                every_script: bool = False) -> CaptureResult:
+    """EVERY_SCRIPT keeps all same-site scripts, past MAX_JS_BUNDLES and MAX_BUNDLE_CHARS."""
     requests: list[RawRequest] = []
     scripts: dict[str, str] = {}
     urls: list[str] = []
@@ -285,7 +287,7 @@ def har_capture(data: Any, path: Path, domain: str | None = None) -> CaptureResu
         content_type = _content_type(response)
         if _is_script(url, content_type):
             text = _text(_content(response))
-            if text and len(text) < config.MAX_BUNDLE_CHARS:
+            if text and (every_script or len(text) < config.MAX_BUNDLE_CHARS):
                 scripts.setdefault(url, text)
             continue
         try:
@@ -294,5 +296,5 @@ def har_capture(data: Any, path: Path, domain: str | None = None) -> CaptureResu
             continue
     domain, final_url = _site(requests, urls, domain)
     same_site = [(url, text) for url, text in scripts.items() if _same_site(url, domain)]
-    bundles = dict(same_site[:config.MAX_JS_BUNDLES])
+    bundles = dict(same_site if every_script else same_site[:config.MAX_JS_BUNDLES])
     return CaptureResult(requests=requests, domain=domain, final_url=final_url, js_bundles=bundles)

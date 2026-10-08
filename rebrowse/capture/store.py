@@ -57,12 +57,13 @@ def saved_domains() -> list[str]:
     return sorted(re.sub(r"_(\d+)$", r":\1", stem) for stem in stems)
 
 
-def load_traffic(path: str | Path, domain: str | None = None) -> CaptureResult:
+def load_traffic(path: str | Path, domain: str | None = None,
+                 every_script: bool = False) -> CaptureResult:
     """Read a HAR file or a saved capture; raises ValueError."""
     path = Path(path)
     data = read_json(path)
     if isinstance(data, dict) and "log" in data:
-        return har_capture(data, path, domain)
+        return har_capture(data, path, domain, every_script)
     try:
         capture = CaptureResult.model_validate(data)
     except ValidationError as e:

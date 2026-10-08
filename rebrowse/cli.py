@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 import socket
 import sys
@@ -49,6 +50,7 @@ def main():
       diff <a> <b>      report API changes between two recordings
       contract <source> replay recorded reads against a server, report breaking changes
       baseline <source> write a recording that is safe to commit (no credentials or response values)
+      coverage <source> API calls the frontend's JS makes that a recording never exercised
       mcp               serve skills to agents over MCP (stdio)
     """
     ensure_dirs()
@@ -182,6 +184,12 @@ def openapi(target: str, domain: str | None, out: Path | None):
     })
 
 
+def _a_number(value: float | None) -> float | None:
+    if value is not None and math.isnan(value):
+        raise click.BadParameter("must be a number from 0 to 100")
+    return value
+
+
 def _port_taken(port: int) -> bool:
     with socket.socket() as probe:
         probe.settimeout(0.5)
@@ -192,7 +200,8 @@ def _netloc(text: str) -> str:
     return urlsplit(text).netloc if "://" in text else text
 
 
-def _traffic(source: str, domain: str | None) -> tuple[Path, CaptureResult]:
+def _traffic(source: str, domain: str | None,
+             every_script: bool = False) -> tuple[Path, CaptureResult]:
     """Load SOURCE as a file, else the newest saved capture of that host; raises ValueError."""
     from rebrowse.capture.store import latest_capture, load_traffic, saved_domains
 
@@ -203,7 +212,7 @@ def _traffic(source: str, domain: str | None) -> tuple[Path, CaptureResult]:
         saved = ", ".join(saved_domains()) or "none"
         raise ValueError(f"'{source}' is neither a file nor a domain with a saved capture "
                          f"(saved: {saved}). For an imported HAR, pass the HAR file.")
-    return path, load_traffic(path, _netloc(domain) if domain else None)
+    return path, load_traffic(path, _netloc(domain) if domain else None, every_script)
 
 
 @main.command(short_help="Serve recorded API responses on 127.0.0.1.")
@@ -470,6 +479,39 @@ def baseline(source: str, domain: str | None, out: Path | None):
     _emit({"source": str(path.resolve()), "domain": result.domain, "path": str(out),
            "routes": len(build_routes(result, redirects=True)),
            "recorded": len(capture.requests), "requests": len(result.requests)})
+
+
+@main.command(short_help="List API calls in the frontend's JS that a recording never made.")
+@click.argument("source")
+@click.option("--domain", "-d", default=None, metavar="HOST[:PORT]",
+              help="Site in a HAR to check (default: host of the first HTML page).")
+@click.option("--fail-under", type=click.FloatRange(0, 100), default=None, metavar="PERCENT",
+              callback=lambda ctx, param, value: _a_number(value),
+              help="Exit 1 when coverage is below PERCENT.")
+def coverage(source: str, domain: str | None, fail_under: float | None):
+    """Report the API routes and GraphQL operations that SOURCE's own JS bundles reference and
+    SOURCE never recorded with a 2xx or 304 answer, with the effect of each.
+
+    SOURCE is a HAR file, whose first-party scripts are all read, a capture saved by build,
+    which keeps a limited number of scripts, or a HOST[:PORT] whose newest saved
+    capture is used; a baseline keeps no JS. Nothing is sent over the network, no LLM is
+    called and no bundle source is printed. Exits 1 when coverage is below --fail-under, and 2
+    when SOURCE cannot be read, holds no first-party JS, or its JS references nothing rebrowse
+    can find.
+    """
+    from rebrowse.coverage import coverage_report
+
+    try:
+        path, capture = _traffic(source, domain, every_script=True)
+        report = coverage_report(capture)
+    except ValueError as e:
+        _emit({"error": str(e)}, error_code=2)
+        return
+    _emit({"source": str(path.resolve()), **report})
+    if fail_under is not None and report["coverage"] < fail_under:
+        click.echo(f"[coverage] {report['coverage']:g}% is under --fail-under {fail_under:g}",
+                   err=True)
+        sys.exit(1)
 
 
 @main.command()

@@ -50,6 +50,7 @@ rebrowse baseline e2e.har -o api-baseline.json     # a recording that is safe to
 rebrowse diff api-baseline.json e2e.har            # API changes that break the client
 rebrowse contract api-baseline.json --against http://localhost:8000  # replay reads
 rebrowse diff api-baseline.json e2e.har --accepted diff-accepted.json  # reviewed breaks pass
+rebrowse coverage e2e.har --fail-under 80          # API calls in the JS the recording missed
 rebrowse skills [-q "search"]  |  rebrowse show <id>  |  rebrowse delete <id>
 rebrowse auth set api.github.com ghp_xxx [--type bearer|header|query]
 rebrowse mcp                                       # MCP server over stdio
@@ -68,7 +69,8 @@ Commands print JSON to stdout (progress goes to stderr) and exit non-zero on err
 - Scores, templatizes IDs (`/users/123` → `/users/{users_id}`), and dedupes. GraphQL is
   split into one endpoint per operation.
 - Scans first-party JS bundles for routes, taking the method from the call site
-  (`axios.post(...)` → POST) and turning template literals into placeholders.
+  (`axios.post(...)` → POST, `` api.delete(`/items/${id}`) `` → DELETE) and turning
+  template literals into placeholders.
 - Infers response schemas across every sample (fields seen in all samples are required).
 - Rebuilding a site updates its skill rather than adding a duplicate. An endpoint seen again
   (same method, URL template and GraphQL operation) keeps its id, its description and its
@@ -578,6 +580,75 @@ Nothing is sent over the network.
   trace id or cache-buster is written, so recording the same calls against an unchanged API
   gives the same bytes and the pull-request diff of `api-baseline.json` reads as the API
   change, such as `"total":0` becoming `"total":""`. A baseline of a baseline is the same file.
+
+## Coverage
+
+Docs, mocks, baselines and contract runs cover only the calls a recording happened to make.
+`rebrowse coverage SOURCE` checks the recording against the frontend's own JS and lists the API
+calls the JS can make that the recording never exercised, writes included. SOURCE is read as
+`mock` reads it: a HAR file, a capture saved by `build`, or a `host[:port]` whose newest saved
+capture is used (`--domain` picks the site in a HAR).
+
+```bash
+rebrowse coverage e2e.har                   # what the e2e suite never called
+rebrowse coverage e2e.har --fail-under 80   # CI: exit 1 when coverage is below 80%
+```
+
+The JSON report gives the number of `bundles` scanned, the API routes and GraphQL operations
+they reference (`referenced`), and the percentage of those that were recorded (`coverage`).
+Each `unrecorded` reference carries its `effect` (`read`, `write` or `destructive`), how it was
+found (`found_by`) and its bundle URL without the query. When the matching calls got only
+errors or redirects, it also lists their `statuses`. Each `covered` reference names the
+recorded routes that answered it (`recorded_as`). `unreferenced` counts recorded API routes
+that no reference matched, such as URLs built at runtime, which shows how much of the recording
+the scan could not see. Routes are sorted by path then method and operations by name, so the
+same input gives the same bytes.
+
+- **What is scanned.** The same-site JS bundles in SOURCE, without ad, embed and analytics
+  scripts, as `build` scans them: `fetch`, `axios` and `.get/.post/.put/.patch/.delete` calls,
+  `/api/...` and `/vN/...` strings, and template literals (`` `/api/users/${id}` `` becomes
+  `/api/users/{id}`). A call keeps its method whether its path is a string or a template
+  literal, so `` api.delete(`/api/items/${id}`) `` is `DELETE /api/items/{id}`. The recording
+  adds prefixes. The first segment of every recorded route answered with JSON is searched
+  too, so a recorded `GET /rest/orders` lets the scan find `"/rest/invoices/" + id`. An HTML
+  page such as `/en/home` adds no prefix. Call and prefix paths may contain dots, so legacy
+  endpoints such as `/ajax/get_cart.php` and `/services/OrderService.asmx/GetOrders` are
+  found, while static files (`.js`, `.json`, `.css`, images) are not. GraphQL operations come
+  from source documents (`` gql`query GetCart($id: ID!) {` ``, a minified
+  `"\nmutation RemoveItem{"`) and from precompiled ASTs
+  (`operation:"mutation",name:{kind:"Name",value:"Checkout"}`). Fragments and text such as
+  `"query failed ("` or `` `query failed (${status})` `` are not operations. Telemetry paths
+  are dropped.
+- **Every script in a HAR.** coverage reads every same-site script in a HAR, whatever their
+  number or size. A capture saved by `build` keeps at most 20 scripts under 2 MB each, so for
+  a large app, or as a CI gate, run coverage on a HAR.
+- **Matching.** Hosts are ignored, because bundle paths are relative to the origin. A reference
+  matches the end of a recorded route, so an axios `baseURL` still lines up:
+  `api.get("/orders/summary")` matches `GET /api/v2/orders/summary`, and `"/v1/items"`
+  matches a call to `api.app.test/v1/items`. A placeholder matches any segment, but a literal
+  matches only itself, so `/api/users/me` is not covered by `/api/users/7`. A literal that
+  looks like an id (two or more digits, a long hex string or a UUID) matches a recorded id, as
+  rebrowse templates both alike: `fetch("/api/reports/2024")` is covered by a recording of
+  `/api/reports/2023`. A path that ends in `/` (`"/api/users/" + id`) matches any recorded
+  route that continues past it. A plain string or `fetch()` is taken as a GET and matches any
+  method. An explicit `.post`, `.put`, `.patch` or `.delete` needs a recording with that
+  method. A GraphQL operation matches recorded calls with the same operation name.
+- **Covered** means a matching call was answered with a 2xx or 304. A route recorded only
+  with a 401, a redirect to sign-in or a 500 stays unrecorded and shows those statuses.
+- **CI gate.** `--fail-under PERCENT` exits 1 when coverage is below PERCENT. The full report
+  is still printed, and stderr gets a note. Bad input exits 2: a SOURCE that cannot be read or
+  is unknown, no first-party JS, or JS that references nothing rebrowse can find.
+- **Baselines keep no JS.** A file written by `baseline`, or a HAR saved without content, has
+  no bundles and exits 2. Run coverage on the HAR or capture the baseline was written from, or
+  on a DevTools "Save all as HAR with content" export.
+- **Offline.** coverage reads only SOURCE. It sends nothing over the network, calls no LLM and
+  never prints bundle source.
+- **Blind spots.** It cannot see URLs assembled from runtime config, relative paths without a
+  leading slash, Relay or persisted-only GraphQL documents, or lazy-loaded chunks the recording
+  never loaded. A path outside `/api/`, `/vN/` and the recorded prefixes is found only as the
+  argument of a call such as `fetch("/x/y")` or `` axios.post(`/x/${id}`) ``. A method set in
+  the options of `fetch(url, {method: "DELETE"})` is not read, so that call is taken as a GET.
+  Query parameters, body fields, statuses and schema fields are not compared.
 
 ## Safety model
 
