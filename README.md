@@ -142,8 +142,8 @@ Response bodies are only used to infer schemas. The HAR itself is the source, so
 copied to `captures/`; import it again to re-extract.
 
 rebrowse never imports cookies from a HAR, and `auth set` only holds a bearer token, an
-`X-API-Key` or an `api_key` query value, so an app that signs in with a session cookie can be
-documented but not replayed. `verify` reports such reads as failed: a 401, or `auth_required`
+`X-API-Key` or an `api_key` query value, so `run` and `verify` cannot replay an app that signs
+in with a session cookie; `contract` can, with a session you pass through `--header-env`. `verify` reports such reads as failed: a 401, or `auth_required`
 when the request is redirected to an HTML sign-in page. Importing the same site again, or
 after a `build`, updates its skill and keeps its id. Endpoints seen before keep their ids,
 descriptions and `verify` results, and only endpoints without a description are sent to
@@ -275,7 +275,8 @@ skill, and nothing is stored. SOURCE is read as `mock` reads it, and ORIGIN is
 # backend, never the HAR. Backend CI, on every pull request:
 docker compose up -d --wait api && ./scripts/seed-fixtures.sh   # the data the recording saw
 REBROWSE_HOST_INTERVAL=0 rebrowse contract api-baseline.json --against http://api:8000
-# exit 0: compatible, 1: breaking change or failed replay, 2: bad input or no answer at all
+# exit 0: compatible, 1: breaking change or failed replay,
+# 2: bad input, no answer at all, or every read refused or redirected
 ```
 
 - **What is sent.** Only calls classified as reads: GETs, and GraphQL queries POSTed with
@@ -303,10 +304,38 @@ REBROWSE_HOST_INTERVAL=0 rebrowse contract api-baseline.json --against http://ap
   HTTP as recorded (a non-token name, a value with control or non-ASCII characters), and the
   User-Agent is rebrowse's own. Bodies of non-GET reads are redacted like the query, and so
   are secret-named arguments written into a GraphQL document (`user(token: "...")`). The only
-  credential that can be attached is an API key stored with `rebrowse auth set` for ORIGIN's
-  own host; cookies are never sent, and keys stored for the recorded site never go to ORIGIN.
-  A recording that cannot be sent at all, such as a URL over 64 KB, gives way to the next one,
-  and a route left with none is skipped as `unreplayable`.
+  credentials ORIGIN gets are the `--header-env` headers below and an API key stored with
+  `rebrowse auth set` for ORIGIN's own host; recorded cookies are never sent, and keys stored
+  for the recorded site never go to ORIGIN. A recording that cannot be sent at all, such as a
+  URL over 64 KB, gives way to the next one, and a route left with none is skipped as
+  `unreplayable`.
+- **Credentials.** A backend behind a sign-in answers every replay with a 302 to `/login` or
+  a 401. `--header-env NAME=ENVVAR` sends header NAME, with the value of environment variable
+  ENVVAR, on every replay to ORIGIN; repeat it for a tenant or CSRF-style header. Values are
+  read from the environment only, never from the command line, so they stay out of shell
+  history, process lists and CI logs. Surrounding whitespace, such as the trailing newline
+  of a secret saved from a file, is stripped, and the value is never printed, stored or sent
+  to an LLM: the report lists only the lowercase header names, under `credentials`. A
+  `--header-env` header replaces a recorded header of the same name and the header an
+  `auth set` key for ORIGIN adds, so `--header-env Authorization=CI_TOKEN` wins over a stored
+  bearer key, while a query key stays in the query. Host, User-Agent and the framing headers
+  cannot be set, and an unset variable or a value with control or non-ASCII characters exits
+  2 before anything is sent. That error names at most the header, never the variable or
+  anything after `=`, so a value typed in place of the variable's name, as in
+  `--header-env "Cookie=$SESSION"`, is not printed either. The value goes to ORIGIN exactly
+  as given and nowhere else, since no redirect is followed and no write is sent, so use https
+  for a remote host; an `HTTP(S)_PROXY` set in the environment is honoured, as for every
+  request rebrowse sends. rebrowse never signs in itself: getting the session is your own script
+  or CI secret.
+
+  ```bash
+  # a script of yours signs a seeded test user in and prints its session cookie
+  STAGING_COOKIE="$(./scripts/test-user-session.sh)" rebrowse contract api-baseline.json \
+    --against https://staging.app.com --header-env Cookie=STAGING_COOKIE
+  # CI_API_TOKEN holds "Bearer ...", CI_TENANT the tenant id
+  rebrowse contract api-baseline.json --against http://api:8000 \
+    --header-env Authorization=CI_API_TOKEN --header-env X-Tenant=CI_TENANT
+  ```
 - **Judging.** Each request is sent once, and its live answer is compared with every recorded
   answer to that same request (method, URL and body), so the order of the recording never
   changes the verdict: a list loaded before and after a create is judged against the fields of
@@ -326,6 +355,16 @@ REBROWSE_HOST_INTERVAL=0 rebrowse contract api-baseline.json --against http://ap
   comparison, so its route is reported once, by the failure. When ORIGIN answers none of the
   requests, the run exits 2, which tells "the server did not start" apart from "the API
   broke".
+- **Refused runs.** The run also exits 2, with no report, when ORIGIN refuses (401, 403) or
+  redirects (a 3xx other than 304) every request the recording answered with a 2xx or 304. A
+  refusal the recording already holds for a request, such as `/api/me` recorded as 401 before
+  sign-in, neither counts nor hides the others. Missing or expired credentials, a secret from
+  another environment, or an http ORIGIN that redirects to https then give one error, such as
+  `http://api:8000 refused or redirected every read the recording answered (302 x5)`, naming
+  the `--header-env` headers and their variables, or the `auth set` key that was sent, instead
+  of dozens of breaking changes, and `--update-accepted` never writes. When only some requests
+  are refused, each one is still a breaking `status` change, and `--update-accepted` leaves
+  such changes for you to add by hand, so a half-expired session cannot be accepted either.
 - **Caveats.** The recorded ids must exist on ORIGIN: seed it with the fixtures the recording
   was made against, otherwise `/api/orders/1001` answers 404 and is reported as a breaking
   status change. A field counts as required when every replayed recording carries it, so an
@@ -334,7 +373,8 @@ REBROWSE_HOST_INTERVAL=0 rebrowse contract api-baseline.json --against http://ap
   sent redacted, so a call that needs one (`pageToken`, a `sessionId` variable) usually
   answers 400 and is reported as broken.
 
-The report is JSON on stdout: the source, domain and target; how many routes were replayed,
+The report is JSON on stdout: the source, domain and target; the `--header-env` header
+names, as `credentials`, when any were given; how many routes were replayed,
 how many requests were sent and answered; the skipped routes; the number of breaking changes;
 and the changes ordered by route. Like `diff`, it holds route names, statuses, media types,
 field paths and JSON type names, plus transport error text, never a recorded or live value:

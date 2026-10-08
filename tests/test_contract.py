@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import socket
 import threading
@@ -590,7 +591,8 @@ def test_a_key_for_the_target_never_follows_a_redirect(tmp_path, fixture_site, h
     store_api_key("127.0.0.1", "k1")
     store_api_key("localhost", "k2")
 
-    code, report = _contract(tmp_path, [_get("/sso", {"ok": True})], fixture_site)
+    code, report = _contract(tmp_path, [_get("/api/items", ITEMS), _get("/sso", {"ok": True})],
+                             fixture_site)
 
     assert code == 1
     assert _rows(report) == [("status", "GET /sso", None, [200], [302])]
@@ -839,10 +841,12 @@ def test_a_status_already_recorded_for_the_request_never_breaks(tmp_path):
     with _running(_scripted({
         "/api/me": (401, "application/json", b'{"error": "sign in"}'),
         "/api/orders/7": (302, "text/html", b""),
+        "/api/items": (200, "application/json", json.dumps(ITEMS).encode()),
     })) as origin:
         code, report = _contract(tmp_path, [
             _get("/api/me", {"error": "x"}, status=401), _get("/api/me", {"id": 1}),
             _get("/api/orders/7", {"error": "x"}, status=404), _get("/api/orders/7", {"id": 7}),
+            _get("/api/items", ITEMS),
         ], origin)
 
     assert code == 1
@@ -899,3 +903,437 @@ def test_secret_named_graphql_arguments_are_sent_redacted():
     redacted = 'query User { user(id: 1001, token: "<redacted>") { id } }'
     assert json.loads(sent_post.content)["query"] == redacted
     assert parse_qs(sent_get.url.query.decode())["query"] == [redacted]
+
+
+SENTINEL = "SENTINEL_d41f"
+SESSION = f"sid={SENTINEL}"
+
+
+class _SignedIn(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _answer(self):
+        self.rfile.read(int(self.headers.get("content-length") or 0))
+        cookie = self.headers.get("cookie")
+        self.server.seen.append({"method": self.command, "path": self.path, "cookie": cookie})
+        if cookie != SESSION:
+            self.send_response(302)
+            self.send_header("location", self.server.login)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        body = json.dumps(ITEMS).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_POST = _answer
+
+
+def _signed_in(login: str = "/login") -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _SignedIn)
+    server.seen, server.login = [], login
+    return server
+
+
+def _session_har(tmp_path: Path, *entries: dict) -> Path:
+    return _write(tmp_path, [_page(), _get("/api/items", ITEMS), _get("/api/items?page=2", ITEMS),
+                             *entries])
+
+
+def test_header_values_are_read_from_the_environment():
+    environ = {"STAGING_COOKIE": "sid=abc\n", "CI_TENANT": " acme "}
+
+    headers = contract.env_headers(["Cookie=STAGING_COOKIE", "x-Tenant=CI_TENANT"], environ)
+
+    assert headers == {"Cookie": "sid=abc", "x-Tenant": "acme"}
+
+
+VAR = f"{SENTINEL}_VAR"
+NO_SHAPE = "give NAME=ENVVAR"
+NO_NAME = "the text before '=' is not a header name"
+NO_VARIABLE = "the text after '=' is not an environment variable name"
+BAD_VALUE = "the value for header Cookie has control or non-ASCII characters"
+
+
+@pytest.mark.parametrize("specs, value, named", [
+    ([f"Cookie{SENTINEL}"], SENTINEL, NO_SHAPE),
+    ([f"Authorization: Bearer {SENTINEL}"], SENTINEL, NO_SHAPE),
+    ([f"X {SENTINEL}={VAR}"], SENTINEL, NO_NAME),
+    ([f"Ü{SENTINEL}={VAR}"], SENTINEL, NO_NAME),
+    ([f"Authorization: Bearer {SENTINEL}=="], SENTINEL, NO_NAME),
+    ([f"Cookie=1{SENTINEL}"], SENTINEL, NO_VARIABLE),
+    ([f"Cookie={SENTINEL}-B"], SENTINEL, NO_VARIABLE),
+    ([f"Cookie=sid={SENTINEL}"], SENTINEL, NO_VARIABLE),
+    ([f"{SENTINEL}=="], SENTINEL, NO_VARIABLE),
+    ([f"X-Api-Key={SENTINEL}"], SENTINEL,
+     ("header X-Api-Key names an environment variable that is unset or empty; give the "
+      "variable's name, not its value")),
+    ([f"Cookie={VAR}"], "", "header Cookie names an environment variable that is unset"),
+    ([f"Cookie={VAR}"], " \n", "header Cookie names an environment variable that is unset"),
+    ([f"Cookie={VAR}"], f"{SENTINEL}\r\nX-Injected: 1", BAD_VALUE),
+    ([f"Cookie={VAR}"], f"{SENTINEL}\tx", BAD_VALUE),
+    ([f"Cookie={VAR}"], f"{SENTINEL}é", BAD_VALUE),
+    ([f"Host={VAR}"], SENTINEL, "Host cannot be set"),
+    ([f"user-agent={VAR}"], SENTINEL, "user-agent cannot be set"),
+    ([f"CONTENT-LENGTH={VAR}"], SENTINEL, "CONTENT-LENGTH cannot be set"),
+    ([f"Transfer-Encoding={VAR}"], SENTINEL, "Transfer-Encoding cannot be set"),
+    ([f"connection={VAR}"], SENTINEL, "connection cannot be set"),
+    ([f"Cookie={VAR}", f"cookie={VAR}"], SENTINEL, "header cookie is given twice"),
+])
+def test_a_bad_header_env_never_echoes_its_input_or_value(specs, value, named):
+    with pytest.raises(ValueError) as error:
+        contract.env_headers(specs, {VAR: value})
+
+    assert named in str(error.value) and SENTINEL not in str(error.value)
+
+
+@pytest.mark.parametrize("spec", [
+    "Cookie=REBROWSE_TEST_SESSION", "User-Agent=REBROWSE_TEST_SESSION",
+    "Cookie=REBROWSE_TEST_UNSET", f"Cookie=sid={SENTINEL}", f"X-Api-Key={SENTINEL}",
+    f"sid={SENTINEL}", f"{SENTINEL}==", f"Authorization: Bearer {SENTINEL}",
+])
+def test_an_invalid_header_env_exits_2_before_anything_is_sent(
+        tmp_path, fixture_site, hits, monkeypatch, spec):
+    monkeypatch.setenv("REBROWSE_TEST_SESSION", f"{SENTINEL}\r\nX-Injected: 1")
+    monkeypatch.delenv("REBROWSE_TEST_UNSET", raising=False)
+
+    result = _run(str(_write(tmp_path, [_page(), _get("/api/items", ITEMS)])),
+                  "--against", fixture_site, "--header-env", spec)
+
+    assert result.exit_code == 2 and "--header-env" in result.stderr
+    assert SENTINEL not in result.stdout + result.stderr
+    assert sum(hits.values()) == 0
+
+
+def test_env_headers_replace_recorded_headers_and_the_target_key():
+    req = RawRequest(url=f"{SITE}/api/items?page=2", method="GET", response_status=200,
+                     request_headers={"x-tenant": "recorded", "Accept": "application/json"})
+    store_api_key("127.0.0.1", "k1")
+
+    keyed = contract.replay_request(req, "http://127.0.0.1:9",
+                                    {"Cookie": "sid=abc", "X-Tenant": "acme"})
+    replaced = contract.replay_request(req, "http://127.0.0.1:9", {"Authorization": "Bearer ci"})
+    store_api_key("127.0.0.1", "k1", auth_type="query")
+    query = contract.replay_request(req, "http://127.0.0.1:9", {"Authorization": "Bearer ci"})
+
+    assert dict(keyed.headers) == {
+        "host": "127.0.0.1:9", "accept": "application/json", "user-agent": config.REBROWSE_UA,
+        "authorization": "Bearer k1", "cookie": "sid=abc", "x-tenant": "acme"}
+    assert replaced.headers["authorization"] == "Bearer ci"
+    assert str(query.url) == "http://127.0.0.1:9/api/items?page=2&api_key=k1"
+    assert query.headers["authorization"] == "Bearer ci"
+
+
+def test_a_session_from_the_environment_signs_every_replay_in(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGING_COOKIE", f"{SESSION}\n")
+    server = _signed_in()
+
+    with _running(server) as origin:
+        result = _run(str(_session_har(tmp_path)), "--against", origin,
+                      "--header-env", "Cookie=STAGING_COOKIE")
+
+    report = json.loads(result.stdout)
+    assert (result.exit_code, report["answered"], report["changes"]) == (0, 2, [])
+    assert list(report)[:4] == ["source", "domain", "target", "credentials"]
+    assert report["credentials"] == ["cookie"]
+    assert [seen["cookie"] for seen in server.seen] == [SESSION, SESSION]
+    assert SENTINEL not in result.stdout + result.stderr
+
+
+def test_a_server_that_refuses_every_read_is_an_input_error(tmp_path):
+    har = _session_har(tmp_path)
+    created, kept = tmp_path / "created.json", tmp_path / "kept.json"
+    kept.write_text('[{"kind": "status", "route": "GET /api/items"}]\n', encoding="utf-8")
+    before = kept.read_bytes()
+
+    with _running(_signed_in()) as origin:
+        runs = [_run(str(har), "--against", origin, *args) for args in (
+            (), ("--accepted", str(created), "--update-accepted"),
+            ("--accepted", str(kept), "--update-accepted"))]
+
+    assert [run.exit_code for run in runs] == [2, 2, 2]
+    assert json.loads(runs[0].stdout) == {"error": (
+        f"{origin} refused or redirected every read the recording answered (302 x2); pass "
+        "credentials with --header-env NAME=ENVVAR, such as --header-env Cookie=SESSION_COOKIE, "
+        "or check ORIGIN's scheme and host")}
+    assert not created.exists() and kept.read_bytes() == before
+
+
+def test_refused_credentials_are_named_but_never_printed(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGING_COOKIE", f"sid=EXPIRED_{SENTINEL}")
+
+    with _running(_signed_in()) as origin:
+        result = _run(str(_session_har(tmp_path)), "--against", origin,
+                      "--header-env", "Cookie=STAGING_COOKIE")
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["error"] == (
+        f"{origin} refused or redirected every read the recording answered (302 x2) with the "
+        "credentials given (cookie from STAGING_COOKIE); they may have expired or belong to "
+        "another environment, or check ORIGIN's scheme and host")
+    assert SENTINEL not in result.stdout + result.stderr
+
+
+def test_a_credentialed_run_redirected_to_https_still_points_at_the_origin(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGING_COOKIE", SESSION)
+    monkeypatch.setenv("CI_TENANT", "acme")
+
+    with _running(_scripted({
+        "/api/items": (301, "text/html", b""),
+        "/api/items?page=2": (301, "text/html", b""),
+    })) as origin:
+        result = _run(str(_session_har(tmp_path)), "--against", origin,
+                      "--header-env", "X-Tenant=CI_TENANT", "--header-env", "Cookie=STAGING_COOKIE")
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout)["error"] == (
+        f"{origin} refused or redirected every read the recording answered (301 x2) with the "
+        "credentials given (cookie from STAGING_COOKIE, x-tenant from CI_TENANT); they may have "
+        "expired or belong to another environment, or check ORIGIN's scheme and host")
+    assert SENTINEL not in result.stdout + result.stderr
+
+
+def test_a_credential_never_follows_a_redirect_off_the_origin(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGING_COOKIE", "sid=EXPIRED")
+    elsewhere = _signed_in()
+
+    with _running(elsewhere) as other:
+        server = _signed_in(f"{other}/login")
+        with _running(server) as origin:
+            result = _run(str(_session_har(tmp_path)), "--against", origin,
+                          "--header-env", "Cookie=STAGING_COOKIE")
+
+    assert result.exit_code == 2
+    assert [seen["cookie"] for seen in server.seen] == ["sid=EXPIRED", "sid=EXPIRED"]
+    assert elsewhere.seen == []
+
+
+def test_credentials_never_send_a_write(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGING_COOKIE", SESSION)
+    mutation = {"operationName": "AddNote", "query": "mutation AddNote { addNote { id } }"}
+    har = _session_har(
+        tmp_path,
+        _entry("POST", f"{SITE}/api/notes", post=_json_post({"text": "hi"}), body='{"id": 1}'),
+        _entry("POST", f"{SITE}/graphql", post=_json_post(mutation), body='{"data": {}}'))
+    server = _signed_in()
+
+    with _running(server) as origin:
+        code, report = _invoke(str(har), "--against", origin,
+                               "--header-env", "Cookie=STAGING_COOKIE")
+
+    assert (code, report["skipped"]) == (0, [
+        {"route": "POST /api/notes", "reason": "write"},
+        {"route": "POST /graphql [GraphQL mutation: AddNote]", "reason": "write"}])
+    assert [seen["method"] for seen in server.seen] == ["GET", "GET"]
+
+
+def test_a_route_refused_while_others_answer_is_a_breaking_status_change(tmp_path):
+    with _running(_scripted({
+        "/api/items": (200, "application/json", json.dumps(ITEMS).encode()),
+        "/api/admin": (401, "application/json", b'{"error": "sign in"}'),
+    })) as origin:
+        code, report = _contract(tmp_path, [_get("/api/items", ITEMS),
+                                            _get("/api/admin", {"ok": True})], origin)
+
+    assert code == 1
+    assert _rows(report) == [("status", "GET /api/admin", None, [200], [401])]
+
+
+def test_a_refusal_the_recording_holds_for_the_request_is_not_a_refused_run(tmp_path):
+    with _running(_scripted({
+        "/api/me": (401, "application/json", b'{"error": "sign in"}'),
+    })) as origin:
+        code, report = _contract(tmp_path, [_get("/api/me", {"error": "x"}, status=401),
+                                            _get("/api/me", {"id": 1})], origin)
+
+    assert (code, report["breaking"]) == (0, 0)
+    assert _rows(report) == [("status", "GET /api/me", None, [200, 401], [401])]
+
+
+def test_an_origin_that_redirects_every_read_to_https_is_an_input_error(tmp_path):
+    with _running(_scripted({
+        "/api/search": (308, "text/html", b""),
+        "/api/items": (301, "text/html", b""),
+    })) as origin:
+        code, report = _contract(tmp_path, [_get("/api/search", RESULTS),
+                                            _get("/api/items", ITEMS)], origin)
+
+    assert code == 2
+    assert report["error"].startswith(
+        f"{origin} refused or redirected every read the recording answered (301 x1, 308 x1); "
+        "pass credentials with --header-env")
+
+
+def test_credentials_are_reported_by_name_in_a_stable_order(tmp_path, fixture_site, monkeypatch):
+    monkeypatch.setenv("CI_TENANT", "acme")
+    monkeypatch.setenv("CI_COOKIE", SESSION)
+    har = _write(tmp_path, [_page(), _get("/api/items", ITEMS), _get("/api/search", RESULTS)])
+    args = (str(har), "--against", fixture_site,
+            "--header-env", "X-Tenant=CI_TENANT", "--header-env", "Cookie=CI_COOKIE")
+
+    first, second = _run(*args), _run(*args)
+
+    assert first.exit_code == second.exit_code == 0
+    assert first.stdout == second.stdout
+    assert json.loads(first.stdout)["credentials"] == ["cookie", "x-tenant"]
+    assert SENTINEL not in first.stdout
+
+
+def test_contract_help_documents_header_env():
+    assert "--header-env NAME=ENVVAR" in CliRunner().invoke(main, ["contract", "--help"]).output
+
+
+def test_a_session_check_recorded_signed_out_does_not_hide_a_refused_run(tmp_path):
+    with _running(_scripted({
+        "/api/me": (401, "application/json", b'{"error": "sign in"}'),
+        "/api/items": (401, "application/json", b'{"error": "sign in"}'),
+        "/api/search": (401, "application/json", b'{"error": "sign in"}'),
+    })) as origin:
+        code, report = _contract(tmp_path, [
+            _get("/api/me", {"error": "x"}, status=401), _get("/api/me", {"id": 1}),
+            _get("/api/items", ITEMS), _get("/api/search", RESULTS)], origin)
+
+    assert code == 2
+    assert report["error"].startswith(f"{origin} refused or redirected every read the recording "
+                                      "answered (401 x2);")
+
+
+def test_a_refused_stored_key_is_named_in_the_error(tmp_path):
+    store_api_key("127.0.0.1", "expired-key")
+    with _running(_scripted({"/api/items": (401, "application/json", b'{"e": 1}')})) as origin:
+        code, report = _contract(tmp_path, [_get("/api/items", ITEMS)], origin)
+
+    assert code == 2 and "key stored for 127.0.0.1 by 'auth set'" in report["error"]
+    assert "expired-key" not in report["error"]
+
+
+def test_routes_recorded_only_as_refusals_never_hide_a_refused_run(tmp_path):
+    with _running(_scripted({
+        "/moved": (302, "text/html", b""),
+        "/api/items": (302, "text/html", b""),
+        "/api/me": (401, "application/json", b'{"error": "sign in"}'),
+        "/api/admin": (403, "application/json", b'{"error": "forbidden"}'),
+    })) as origin:
+        code, report = _contract(tmp_path, [
+            _entry("GET", f"{SITE}/moved", status=302, mime="text/html", body=""),
+            _get("/api/admin", {"ok": True}), _get("/api/me", {"id": 1}),
+            _get("/api/items", ITEMS)], origin)
+
+    assert code == 2
+    assert report["error"].startswith(f"{origin} refused or redirected every read the recording "
+                                      "answered (302 x1, 401 x1, 403 x1);")
+
+
+def test_a_challenge_page_does_not_turn_a_refused_run_into_a_report(tmp_path):
+    challenge = b"<html><title>Just a moment...</title></html>"
+    with _running(_scripted({
+        "/api/carts": (403, "text/html", challenge),
+        "/api/items": (302, "text/html", b""),
+    })) as origin:
+        code, report = _contract(tmp_path, [_get("/api/carts", {"ok": True}),
+                                            _get("/api/items", ITEMS)], origin)
+
+    assert code == 2
+    assert "every read the recording answered (302 x1)" in report["error"]
+
+
+def test_a_credentialed_run_never_writes_its_value_into_the_accepted_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGING_COOKIE", SESSION)
+    accepted = tmp_path / "accepted.json"
+
+    with _running(_scripted({
+        "/api/items": (200, "application/json", json.dumps(ITEMS).encode()),
+        "/api/admin": (404, "application/json", b'{"error": "gone"}'),
+    })) as origin:
+        result = _run(str(_write(tmp_path, [_page(), _get("/api/items", ITEMS),
+                                            _get("/api/admin", {"ok": True})])),
+                      "--against", origin, "--header-env", "Cookie=STAGING_COOKIE",
+                      "--accepted", str(accepted), "--update-accepted")
+
+    report = json.loads(result.stdout)
+    assert (result.exit_code, report["credentials"], report["accepted"]) == (0, ["cookie"], 1)
+    assert [entry["route"] for entry in json.loads(accepted.read_text())] == ["GET /api/admin"]
+    assert SENTINEL not in result.stdout + result.stderr + accepted.read_text()
+
+
+def test_credentials_go_with_graphql_queries_but_not_off_origin_requests(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGING_COOKIE", SESSION)
+    query = {"operationName": "Items", "query": "query Items { items { id } }"}
+    har = _session_har(
+        tmp_path,
+        _entry("POST", f"{SITE}/graphql", post=_json_post(query), body='{"data": {}}'),
+        _get("http://api.app.local/api/other", ITEMS))
+    server = _signed_in()
+
+    with _running(server) as origin:
+        _, report = _invoke(str(har), "--against", origin, "--header-env", "Cookie=STAGING_COOKIE")
+
+    assert {row["reason"] for row in report["skipped"]} == {"other host"}
+    assert sorted((seen["method"], seen["cookie"]) for seen in server.seen) == [
+        ("GET", SESSION), ("GET", SESSION), ("POST", SESSION)]
+
+
+@pytest.mark.parametrize("name", ["Keep-Alive", "te", "TRAILER", "upgrade"])
+def test_the_other_framing_headers_cannot_be_set(name):
+    with pytest.raises(ValueError, match=f"{name} cannot be set"):
+        contract.env_headers([f"{name}={VAR}"], {VAR: SENTINEL})
+
+
+@pytest.mark.parametrize("auth_type, header", [("bearer", "authorization"),
+                                               ("header", "x-api-key")])
+def test_an_env_header_is_the_only_one_of_its_name_sent(auth_type, header):
+    req = RawRequest(url=f"{SITE}/api/items", method="GET", response_status=200,
+                     request_headers={"Cookie": "sid=RECORDED", header: "Bearer RECORDED"})
+    store_api_key("127.0.0.1", "k1", auth_type=auth_type)
+
+    sent = contract.replay_request(req, "http://127.0.0.1:9",
+                                   {"COOKIE": "sid=abc", header.upper(): "ci"})
+
+    assert sent.headers.get_list("cookie") == ["sid=abc"]
+    assert sent.headers.get_list(header) == ["ci"]
+
+
+@pytest.mark.parametrize("statuses", [(404, 404), (302, 500), (302, 304)],
+                         ids=["unseeded", "server error", "not modified"])
+def test_a_run_with_a_read_that_was_not_refused_is_judged(tmp_path, statuses):
+    paths = ("/api/items", "/api/search")
+    answers = {path: (status, "application/json", b"") for path, status in zip(paths, statuses)}
+
+    with _running(_scripted(answers)) as origin:
+        code, report = _contract(tmp_path, [_get("/api/items", ITEMS),
+                                            _get("/api/search", RESULTS)], origin)
+
+    assert code == 1 and "error" not in report
+    assert ("status", "GET /api/items", None, [200], [statuses[0]]) in _rows(report)
+
+
+def test_credentials_given_through_the_python_api_are_named_by_header(tmp_path):
+    capture = CaptureResult(domain="app.local", final_url=f"{SITE}/", requests=[RawRequest(
+        url=f"{SITE}/api/items", method="GET", response_status=200,
+        response_headers={"content-type": "application/json"}, response_body=json.dumps(ITEMS))])
+    headers = {"X-Tenant": "acme", "Cookie": f"sid=EXPIRED_{SENTINEL}"}
+
+    with _running(_signed_in()) as origin:
+        report = asyncio.run(contract.run_contract(capture, origin, headers))
+
+    assert report == {"error": (
+        f"{origin} refused or redirected every read the recording answered (302 x1) with the "
+        "credentials given (cookie, x-tenant); they may have expired or belong to another "
+        "environment, or check ORIGIN's scheme and host")}
+
+
+def test_a_credentialed_run_that_is_refused_never_writes_the_accepted_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("STAGING_COOKIE", f"sid=EXPIRED_{SENTINEL}")
+    accepted = tmp_path / "accepted.json"
+
+    with _running(_signed_in()) as origin:
+        result = _run(str(_session_har(tmp_path)), "--against", origin,
+                      "--header-env", "Cookie=STAGING_COOKIE",
+                      "--accepted", str(accepted), "--update-accepted")
+
+    assert result.exit_code == 2 and not accepted.exists()
+    assert SENTINEL not in result.stdout + result.stderr

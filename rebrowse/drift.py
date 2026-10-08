@@ -160,14 +160,14 @@ def _change(severity: str, kind: str, route: str, base: Any, head: Any,
     return {**change, "base": base, "head": head}
 
 
-def _answers(statuses: set[int]) -> bool:
+def answers(statuses: set[int]) -> bool:
     return any(200 <= status < 300 or status == 304 for status in statuses)
 
 
 def status_breaks(before: set[int], after: set[int]) -> bool:
-    if not _answers(before):
+    if not answers(before):
         return False
-    return not _answers(after) or any(status >= 500 for status in after - before)
+    return not answers(after) or any(status >= 500 for status in after - before)
 
 
 def _compare_route(before: Facts, after: Facts) -> Iterator[dict]:

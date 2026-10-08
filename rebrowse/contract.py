@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from http import HTTPStatus
 from itertools import islice
 from typing import NamedTuple
@@ -13,7 +15,13 @@ import httpx
 
 from rebrowse import config, drift, net
 from rebrowse.auth.vault import get_api_key
-from rebrowse.capture.har import content_type_of, credential_in_path, scrub_url, sendable_headers
+from rebrowse.capture.har import (
+    HEADER_NAME,
+    content_type_of,
+    credential_in_path,
+    scrub_url,
+    sendable_headers,
+)
 from rebrowse.execution import executor
 from rebrowse.mock import LOOPBACK, Recording, Route, build_routes
 from rebrowse.models import CaptureResult, RawRequest
@@ -27,6 +35,10 @@ NO_RESPONSE, BLOCKED = "no_response", "blocked"
 NON_API = "answered with a non-API response"
 UNREPLAYABLE = "unreplayable"
 _RECEIVED = ("content-encoding", "content-length", "transfer-encoding")
+RESERVED_HEADERS = frozenset({
+    "host", "user-agent", "content-length", "transfer-encoding", "connection", "keep-alive",
+    "te", "trailer", "upgrade"})
+_ENV_VAR = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 class Replay(NamedTuple):
@@ -55,6 +67,39 @@ def parse_target(text: str) -> str:
     host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
     port = "" if parts.port is None else f":{parts.port}"
     return f"{parts.scheme}://{host}{port}"
+
+
+def _env_header(spec: str, environ: Mapping[str, str]) -> tuple[str, str]:
+    """Errors name only a reserved or NAME=ENVVAR-shaped header: a pasted value may be anywhere."""
+    name, sep, variable = spec.partition("=")
+    if not sep:
+        raise ValueError("give NAME=ENVVAR, such as Cookie=SESSION_COOKIE")
+    if not HEADER_NAME.fullmatch(name):
+        raise ValueError("the text before '=' is not a header name")
+    if name.lower() in RESERVED_HEADERS:
+        raise ValueError(f"{name} cannot be set; rebrowse sends its own Host, User-Agent "
+                         "and framing headers")
+    if not _ENV_VAR.fullmatch(variable):
+        raise ValueError("the text after '=' is not an environment variable name; give the "
+                         "variable's name, not its value")
+    value = environ.get(variable, "").strip()
+    if not value:
+        raise ValueError(f"header {name} names an environment variable that is unset or "
+                         "empty; give the variable's name, not its value")
+    if not (value.isascii() and value.isprintable()):
+        raise ValueError(f"the value for header {name} has control or non-ASCII characters")
+    return name, value
+
+
+def env_headers(specs: Iterable[str], environ: Mapping[str, str]) -> dict[str, str]:
+    """Header NAME with the value of ENVVAR for each NAME=ENVVAR; raises ValueError."""
+    headers: dict[str, str] = {}
+    for spec in specs:
+        name, value = _env_header(spec, environ)
+        if name.lower() in {given.lower() for given in headers}:
+            raise ValueError(f"header {name} is given twice")
+        headers[name] = value
+    return headers
 
 
 def _skip_reason(route: Route, req: RawRequest, rec: Recording) -> str | None:
@@ -86,16 +131,17 @@ def _sent_from(recordings: list[RawRequest]) -> RawRequest:
     return min(recordings, key=lambda req: sorted(sendable_headers(req.request_headers).items()))
 
 
-def _build(req: RawRequest, target: str) -> httpx.Request | None:
+def _build(req: RawRequest, target: str, headers: Mapping[str, str]) -> httpx.Request | None:
     try:
-        return replay_request(req, target)
+        return replay_request(req, target, headers)
     except (httpx.InvalidURL, ValueError):
         return None
 
 
-def _picks(route: Route, candidates: list[list[RawRequest]], target: str) -> list[Replay]:
+def _picks(route: Route, candidates: list[list[RawRequest]], target: str,
+           headers: Mapping[str, str]) -> list[Replay]:
     built = (Replay(route, group, request) for group in candidates
-             if (request := _build(_sent_from(group), target)) is not None)
+             if (request := _build(_sent_from(group), target, headers)) is not None)
     return list(islice(built, MAX_REPLAYS_PER_ROUTE))
 
 
@@ -105,12 +151,13 @@ def _skipped(route: Route, requests: list[RawRequest], candidates: list[list[Raw
     return {"route": route.name, "reason": reason}
 
 
-def plan(capture: CaptureResult, target: str) -> tuple[list[Replay], list[dict]]:
+def plan(capture: CaptureResult, target: str,
+         headers: Mapping[str, str] | None = None) -> tuple[list[Replay], list[dict]]:
     replays: list[Replay] = []
     skipped: list[dict] = []
     for route in build_routes(capture, redirects=True):
         candidates = _candidates(route, capture.requests)
-        if picks := _picks(route, candidates, target):
+        if picks := _picks(route, candidates, target, headers or {}):
             replays.extend(picks)
         else:
             skipped.append(_skipped(route, capture.requests, candidates))
@@ -132,22 +179,29 @@ def _target_key(target: str) -> dict | None:
     return get_api_key(urlsplit(target).hostname or "")
 
 
-def replay_request(req: RawRequest, target: str) -> httpx.Request:
+def _replaced(headers: dict[str, str], given: Mapping[str, str]) -> dict[str, str]:
+    names = {name.lower() for name in given}
+    return {**{k: v for k, v in headers.items() if k.lower() not in names}, **given}
+
+
+def replay_request(req: RawRequest, target: str,
+                   headers: Mapping[str, str] | None = None) -> httpx.Request:
     """Raises httpx.InvalidURL or ValueError for a recording that cannot be sent."""
     recorded = scrub_url(req.url)
     if recorded is None:
         raise ValueError("the recorded URL is not an http(s) URL without a credential")
     parts = urlsplit(recorded)
-    headers = _headers(req.request_headers)
+    sent = _headers(req.request_headers)
     key_query: dict[str, str] = {}
     if key := _target_key(target):
-        executor.add_api_key(key, headers, key_query)
+        executor.add_api_key(key, sent, key_query)
+    sent = _replaced(sent, headers or {})
     query = _query(parts.query, key_query)
     url = f"{target}{parts.path or '/'}" + (f"?{query}" if query else "")
     body = None
     if req.method != "GET" and req.request_body is not None:
         body = redact_body(req.request_body, content_type_of(req.request_headers))
-    return httpx.Request(req.method, url, headers=headers, content=body)
+    return httpx.Request(req.method, url, headers=sent, content=body)
 
 
 def _live(req: RawRequest, resp: httpx.Response) -> RawRequest:
@@ -271,8 +325,47 @@ def _changes(capture: CaptureResult, answers: list[Answer], failed: list[Failure
     return sorted(regressions + drifted + failures, key=lambda change: change["route"])
 
 
-async def run_contract(capture: CaptureResult, target: str) -> dict:
-    replays, skipped = plan(capture, target)
+def _refusal(status: int) -> bool:
+    return status in (401, 403) or (300 <= status < 400 and status != HTTPStatus.NOT_MODIFIED)
+
+
+def _refusals(answers: list[Answer]) -> Counter[int]:
+    """The refused statuses, when ORIGIN refused every request the recording answered."""
+    refused: Counter[int] = Counter()
+    for replay, live in answers:
+        recorded = {req.response_status for req in replay.recordings}
+        if not drift.answers(recorded):
+            continue
+        if not _refusal(live.response_status):
+            return Counter()
+        if live.response_status not in recorded:
+            refused[live.response_status] += 1
+    return refused
+
+
+def _refused_error(target: str, refused: Counter[int], headers: Mapping[str, str],
+                   variables: Mapping[str, str]) -> str:
+    statuses = ", ".join(f"{status} x{count}" for status, count in sorted(refused.items()))
+    error = f"{target} refused or redirected every read the recording answered ({statuses})"
+    if not headers and _target_key(target):
+        host = urlsplit(target).hostname
+        return (f"{error} with the key stored for {host} by 'auth set'; it may have expired, "
+                "or pass credentials with --header-env NAME=ENVVAR")
+    if not headers:
+        return (f"{error}; pass credentials with --header-env NAME=ENVVAR, such as "
+                "--header-env Cookie=SESSION_COOKIE, or check ORIGIN's scheme and host")
+    given = sorted(f"{name.lower()} from {variables[name]}" if name in variables
+                   else name.lower() for name in headers)
+    return (f"{error} with the credentials given ({', '.join(given)}); they may have expired "
+            "or belong to another environment, or check ORIGIN's scheme and host")
+
+
+async def run_contract(capture: CaptureResult, target: str,
+                       headers: Mapping[str, str] | None = None,
+                       variables: Mapping[str, str] | None = None) -> dict:
+    """VARIABLES names the environment variable each of HEADERS was read from, for errors."""
+    headers = headers or {}
+    replays, skipped = plan(capture, target, headers)
     if not replays:
         reasons = Counter(row["reason"] for row in skipped)
         why = ", ".join(f"{count} {reason}" for reason, count in sorted(reasons.items()))
@@ -282,10 +375,14 @@ async def run_contract(capture: CaptureResult, target: str) -> dict:
     answers, failed, answered = await _replay_all(replays, target)
     if not answered:
         return {"error": f"No response from {target}: {failed[0].error}"}
+    if refused := _refusals(answers):
+        return {"error": _refused_error(target, refused, headers, variables or {})}
     changes = _changes(capture, answers, failed)
+    credentials = {"credentials": sorted(name.lower() for name in headers)} if headers else {}
     return {
         "domain": capture.domain,
         "target": target,
+        **credentials,
         "routes": len({replay.route.name for replay in replays}),
         "replayed": len(replays),
         "answered": answered,

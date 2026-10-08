@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import socket
 import sys
 from pathlib import Path
@@ -252,6 +253,7 @@ def _settle_accepted(command: str, report: dict, file: Path | None,
     from rebrowse.accepted import (
         ACCEPTED,
         apply_accepted,
+        needs_review,
         unsettled,
         update_accepted,
         write_accepted,
@@ -267,6 +269,10 @@ def _settle_accepted(command: str, report: dict, file: Path | None,
                    "failed to replay or answered with a server error", err=True)
     elif update:
         entries = update_accepted(changes, entries, uncompared)
+        if held := sum(needs_review(change) for change in changes):
+            click.echo(f"[{command}] not accepting {_count(held, 'change', 'changes')} from an "
+                       f"answer to a sign-in redirect, 401 or 403 in {file}; add them by hand "
+                       "if they are intended", err=True)
         try:
             write_accepted(file, entries)
         except OSError as e:
@@ -337,36 +343,48 @@ def diff(base: str, head: str, domains: tuple[str, ...], accepted: Path | None,
 @click.argument("source")
 @click.option("--against", required=True, metavar="ORIGIN",
               help="Server to test, as scheme://host[:port].")
+@click.option("--header-env", "header_env", multiple=True, metavar="NAME=ENVVAR",
+              help="Send header NAME, with the value of environment variable ENVVAR, on every "
+                   "replay to ORIGIN. Repeatable. Values are read from the environment only "
+                   "and are never printed. Replaces a recorded header of the same name and the "
+                   "header an 'auth set' key for ORIGIN adds. Host, User-Agent and framing "
+                   "headers cannot be set.")
 @click.option("--domain", "-d", default=None, metavar="HOST[:PORT]",
               help="Site to test in a HAR (default: host of the first HTML page).")
 @_accepted_options
-def contract(source: str, against: str, domain: str | None, accepted: Path | None,
-             update_accepted: bool):
+def contract(source: str, against: str, header_env: tuple[str, ...], domain: str | None,
+             accepted: Path | None, update_accepted: bool):
     """Replay the reads recorded in SOURCE against ORIGIN and report what breaks the client.
 
     SOURCE is a HAR file, a capture saved by build, or a HOST[:PORT] whose newest saved
     capture is used. Only reads are sent, at most three per route, one at a time, without
     retries or following redirects; calls to sibling hosts are skipped. Secret-named values
-    are redacted, recorded credentials and cookies are never sent, and the only credential
-    is an API key stored with 'auth set' for ORIGIN's host. Answers are judged as diff
-    judges them, and breaking changes listed in the --accepted FILE are reported as
-    accepted; a failed replay cannot be accepted. Exits 1 when a change is breaking and not
-    accepted or a replay failed, and 2 on bad input or FILE, no reads to replay, or when
-    ORIGIN never answered.
+    are redacted and recorded credentials and cookies are never sent. The credentials sent
+    to ORIGIN are the --header-env headers and an API key stored with 'auth set' for
+    ORIGIN's host; rebrowse never signs in itself. Answers are judged as diff judges them,
+    and breaking changes listed in the --accepted FILE are reported as accepted; a failed
+    replay cannot be accepted. Exits 1 when a change is breaking and not accepted or a
+    replay failed, and 2 on bad input or FILE, no reads to replay, when ORIGIN never
+    answered, or when it refused or redirected every read the recording answered.
     """
-    from rebrowse.contract import BLOCKED, NO_RESPONSE, parse_target, run_contract
+    from rebrowse.contract import BLOCKED, NO_RESPONSE, env_headers, parse_target, run_contract
 
     try:
         target = parse_target(against)
     except ValueError as e:
         raise click.BadParameter(str(e), param_hint="--against")
     try:
+        headers = env_headers(header_env, os.environ)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="--header-env")
+    try:
         entries = _accepted_entries(accepted, update_accepted)
         path, capture = _traffic(source, domain)
     except ValueError as e:
         _emit({"error": str(e)}, error_code=2)
         return
-    report = asyncio.run(run_contract(capture, target))
+    variables = dict(spec.split("=", 1) for spec in header_env)
+    report = asyncio.run(run_contract(capture, target, headers, variables))
     if "error" in report:
         _emit(report, error_code=2)
         return

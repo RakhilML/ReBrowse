@@ -19,7 +19,7 @@ _CREDENTIAL_VALUE = re.compile(
     r"(bearer|basic|token|digest|negotiate|ntlm|hmac)\s|eyJ[\w-]+\.[\w-]+\.", re.IGNORECASE)
 _TOKEN_VALUE = re.compile(r"bearer\s|eyJ[\w-]+\.[\w-]+\.", re.IGNORECASE)
 _JSONP_PARAMS = frozenset({"callback", "jsonp", "cb"})
-_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _NOT_SENT = frozenset({
     "origin", "referer", "content-encoding",
     "if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "if-range",
@@ -143,7 +143,7 @@ def content_type_of(headers: dict[str, str]) -> str:
 
 def _sendable(name: str, value: str) -> bool:
     low = name.lower()
-    return (bool(_HEADER_NAME.fullmatch(name)) and value.isascii() and value.isprintable()
+    return (bool(HEADER_NAME.fullmatch(name)) and value.isascii() and value.isprintable()
             and replayable_header(name) and low not in _NOT_SENT
             and not low.startswith(_NOT_SENT_PREFIXES) and not credential_value(value))
 
