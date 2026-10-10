@@ -5,8 +5,12 @@ from __future__ import annotations
 import base64
 import json
 import re
+import stat
+import zipfile
+import zlib
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
+from lzma import LZMAError
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
@@ -31,17 +35,147 @@ _NOT_SENT = frozenset({
 })
 _NOT_SENT_PREFIXES = ("x-b3-", "x-datadog-", "uberctx-")
 _CACHE_BUSTER = re.compile(r"_=[0-9]+")
+_ATTACHMENT_NAME = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,254}")
+_UNREADABLE = (OSError, EOFError, zipfile.BadZipFile, zlib.error, LZMAError, RuntimeError,
+               UnicodeDecodeError)
+_CUT_SHORT = (zipfile.BadZipFile, EOFError)
+_LOCAL_HEADER = b"PK\x03\x04"
+_LFS_POINTER = b"version https://git-lfs"
+_HAR_ENTRY = "har.har"
 
 
 class HarError(ValueError):
     pass
 
 
+def _lfs_error(path: Path) -> HarError | None:
+    try:
+        with path.open("rb") as file:
+            pointer = file.read(len(_LFS_POINTER)) == _LFS_POINTER
+    except OSError:
+        return None
+    return HarError(f"{path} is a Git LFS pointer, not the recording; run git lfs pull") \
+        if pointer else None
+
+
 def read_json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, RecursionError) as e:
-        raise HarError(f"Cannot read {path} as JSON: {e}") from e
+        raise _lfs_error(path) or HarError(f"Cannot read {path} as JSON: {e}") from e
+
+
+class _Attachments:
+    """The body files that a HAR at PATH names in _file, read from the HAR's own folder."""
+
+    missing_hint = "; keep the files Playwright wrote next to the HAR with it"
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def text(self, name: str, limit: int | None) -> str | None:
+        """Attachment NAME as text, or None when it is larger than LIMIT bytes."""
+        if not _ATTACHMENT_NAME.fullmatch(name):
+            raise self._unsafe(name)
+        try:
+            size = self._size(name)
+            if size is None:
+                raise HarError(f"{self.path}: body attachment {name} is missing"
+                               f"{self.missing_hint}")
+            if limit is not None and size > limit:
+                return None
+            return self._read(name).decode("utf-8", errors="replace")
+        except _UNREADABLE as e:
+            raise HarError(f"{self.path}: cannot read body attachment {name}: {e}") from e
+
+    def _unsafe(self, name: str) -> HarError:
+        return HarError(f"{self.path}: attachment name {name!r} is not a plain file name in "
+                        "the HAR's folder")
+
+    def _size(self, name: str) -> int | None:
+        try:
+            info = (self.path.parent / name).lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(info.st_mode):
+            raise self._unsafe(name)
+        return info.st_size
+
+    def _read(self, name: str) -> bytes:
+        return (self.path.parent / name).read_bytes()
+
+
+class _Archive(_Attachments):
+    """The body entries of a Playwright HAR archive at PATH."""
+
+    missing_hint = " from the archive"
+
+    def __init__(self, path: Path, archive: zipfile.ZipFile) -> None:
+        super().__init__(path)
+        self.archive = archive
+
+    def _size(self, name: str) -> int | None:
+        try:
+            return self.archive.getinfo(name).file_size
+        except KeyError:
+            return None
+
+    def _read(self, name: str) -> bytes:
+        return self.archive.read(name)
+
+
+def is_zip(path: Path) -> bool:
+    return path.suffix.lower() == ".zip"
+
+
+def _damaged(path: Path) -> bool:
+    """Whether PATH, which zipfile cannot open, is empty or begins like a zip archive."""
+    try:
+        with path.open("rb") as file:
+            return file.read(len(_LOCAL_HEADER)) in (b"", _LOCAL_HEADER)
+    except OSError as e:
+        raise HarError(f"Cannot read {path}: {e}") from e
+
+
+def _open_archive(path: Path) -> zipfile.ZipFile:
+    try:
+        return zipfile.ZipFile(path)
+    except _CUT_SHORT as e:
+        state = "a damaged" if _damaged(path) else "not a"
+        raise _lfs_error(path) or HarError(f"{path} is {state} zip archive") from e
+    except _UNREADABLE as e:
+        raise HarError(f"Cannot read {path}: {e}") from e
+
+
+def holds_har(path: Path) -> bool:
+    """Whether PATH is a zip archive with a har.har entry, by its index; HarError if damaged."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return _HAR_ENTRY in archive.namelist()
+    except OSError as e:
+        raise HarError(f"Cannot read {path}: {e}") from e
+    except _CUT_SHORT as e:
+        if lfs := _lfs_error(path):
+            raise lfs from e
+        if _damaged(path):
+            raise HarError(f"{path} is a damaged zip archive") from e
+        return False
+    except _UNREADABLE:
+        return False
+
+
+def _archived_har(archive: zipfile.ZipFile, path: Path) -> Any:
+    try:
+        data = archive.read(_HAR_ENTRY)
+    except KeyError as e:
+        raise HarError(f"{path} holds no {_HAR_ENTRY}; rebrowse reads HAR archives written by "
+                       "Playwright's recordHar") from e
+    except _UNREADABLE as e:
+        raise HarError(f"Cannot read {path}!{_HAR_ENTRY}: {e}") from e
+    try:
+        return json.loads(data.decode("utf-8-sig"))
+    except (ValueError, RecursionError) as e:
+        raise HarError(f"Cannot read {path}!{_HAR_ENTRY} as JSON: {e}") from e
 
 
 def _entries(data: Any, path: Path) -> list:
@@ -162,12 +296,20 @@ def _request_headers(request: dict) -> dict[str, str]:
     return {**headers, "referer": referer} if referer else headers
 
 
-def _request_body(post: Any, content_type: str) -> str | None:
+def _attachment(body: dict) -> str | None:
+    """The file named by BODY's _file, which Playwright's replay also prefers to its text."""
+    name = body.get("_file")
+    return name if isinstance(name, str) else None
+
+
+def _request_body(post: Any, content_type: str, attachments: _Attachments) -> str | None:
     if not isinstance(post, dict):
         return None
     mime = str(post.get("mimeType") or content_type).lower()
     text = post.get("text")
-    if not isinstance(text, str) or not text:
+    if (name := _attachment(post)) is not None:
+        text = attachments.text(name, None)
+    elif not isinstance(text, str) or not text:
         params = [(p["name"], "" if p.get("value") is None else str(p["value"]))
                   for p in _dicts(post.get("params")) if isinstance(p.get("name"), str)]
         text, mime = urlencode(params), mime or FORM
@@ -203,27 +345,37 @@ def _text(content: dict) -> str | None:
         return None
 
 
-def _response_body(content: dict, content_type: str) -> str | None:
+def _response_body(content: dict, content_type: str, attachments: _Attachments) -> str | None:
     low = content_type.lower()
     if "json" not in low and "text" not in low:
         return None
+    if (name := _attachment(content)) is not None:
+        return attachments.text(name, config.MAX_BODY_SIZE)
     text = _text(content)
     if text is None or len(text.encode("utf-8", errors="replace")) > config.MAX_BODY_SIZE:
         return None
     return text
 
 
-def _raw_request(url: str, request: dict, response: dict, content_type: str) -> RawRequest:
+def _raw_request(url: str, request: dict, response: dict, content_type: str,
+                 attachments: _Attachments) -> RawRequest:
     headers = _request_headers(request)
+    post = request.get("postData")
     return RawRequest(
         url=url,
         method=request["method"].upper(),
         request_headers=headers,
-        request_body=_request_body(request.get("postData"), headers.get("content-type", "")),
+        request_body=_request_body(post, headers.get("content-type", ""), attachments),
         response_status=response["status"],
         response_headers={"content-type": content_type} if content_type else {},
-        response_body=_response_body(_content(response), content_type),
+        response_body=_response_body(_content(response), content_type, attachments),
     )
+
+
+def _script_text(content: dict, attachments: _Attachments, every_script: bool) -> str | None:
+    if (name := _attachment(content)) is not None:
+        return attachments.text(name, None if every_script else 4 * config.MAX_BUNDLE_CHARS)
+    return _text(content)
 
 
 def _is_script(url: str, content_type: str) -> bool:
@@ -280,20 +432,32 @@ class _Traffic:
     urls: list[str] = field(default_factory=list)
 
 
-def _convert(traffic: _Traffic, data: Any, path: Path, every_script: bool) -> None:
+def _convert(traffic: _Traffic, data: Any, attachments: _Attachments,
+             every_script: bool) -> None:
     """Add the entries of one HAR to TRAFFIC; a script URL seen before keeps its first text."""
-    for url, request, response in _exchanges(_entries(data, path)):
+    for url, request, response in _exchanges(_entries(data, attachments.path)):
         traffic.urls.append(url)
         content_type = _content_type(response)
         if _is_script(url, content_type):
-            text = _text(_content(response))
+            text = None
+            if url not in traffic.scripts:
+                text = _script_text(_content(response), attachments, every_script)
             if text and (every_script or len(text) < config.MAX_BUNDLE_CHARS):
-                traffic.scripts.setdefault(url, text)
+                traffic.scripts[url] = text
             continue
         try:
-            traffic.requests.append(_raw_request(url, request, response, content_type))
+            traffic.requests.append(
+                _raw_request(url, request, response, content_type, attachments))
         except RecursionError:
             continue
+
+
+def _convert_file(traffic: _Traffic, path: Path, every_script: bool) -> None:
+    if not is_zip(path):
+        _convert(traffic, read_json(path), _Attachments(path), every_script)
+        return
+    with _open_archive(path) as archive:
+        _convert(traffic, _archived_har(archive, path), _Archive(path, archive), every_script)
 
 
 def _assemble(traffic: _Traffic, domain: str | None, every_script: bool) -> CaptureResult:
@@ -305,21 +469,22 @@ def _assemble(traffic: _Traffic, domain: str | None, every_script: bool) -> Capt
 
 
 def load_har(path: str | Path, domain: str | None = None) -> CaptureResult:
-    return har_capture(read_json(Path(path)), Path(path), domain)
+    return load_hars([Path(path)], domain)
 
 
 def har_capture(data: Any, path: Path, domain: str | None = None,
                 every_script: bool = False) -> CaptureResult:
     """EVERY_SCRIPT keeps all same-site scripts, past MAX_JS_BUNDLES and MAX_BUNDLE_CHARS."""
     traffic = _Traffic()
-    _convert(traffic, data, path, every_script)
+    _convert(traffic, data, _Attachments(path), every_script)
     return _assemble(traffic, domain, every_script)
 
 
 def load_hars(paths: Iterable[Path], domain: str | None = None,
               every_script: bool = False) -> CaptureResult:
-    """Read the HAR files at PATHS, one at a time and in order, as one recording."""
+    """Read the HAR files or HAR archives at PATHS, one at a time and in order, as one
+    recording."""
     traffic = _Traffic()
     for path in paths:
-        _convert(traffic, read_json(path), path, every_script)
+        _convert_file(traffic, path, every_script)
     return _assemble(traffic, domain, every_script)

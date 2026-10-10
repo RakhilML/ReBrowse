@@ -12,7 +12,7 @@ from typing import NoReturn
 from pydantic import ValidationError
 
 from rebrowse import config
-from rebrowse.capture.har import HarError, har_capture, load_hars, read_json
+from rebrowse.capture.har import HarError, har_capture, holds_har, is_zip, load_hars, read_json
 from rebrowse.models import CaptureResult
 from rebrowse.reverse.extractor import registrable_domain
 
@@ -71,14 +71,21 @@ def _walked(root: str, name: str) -> bool:
                 or _isjunction(os.path.join(root, name)))
 
 
+def _recorded(root: str, name: str) -> bool:
+    if name.startswith("._"):
+        return False
+    path = Path(root, name)
+    return name.lower().endswith(".har") or (is_zip(path) and holds_har(path))
+
+
 def har_files(directory: Path) -> list[Path]:
-    """The .har files under DIRECTORY by POSIX relative path, skipping dot folders,
-    node_modules, __MACOSX and junctions; raises HarError if there are none."""
+    """The .har files and HAR archives under DIRECTORY by POSIX relative path, skipping dot
+    folders, node_modules, __MACOSX and junctions; raises HarError if there are none or a zip
+    is damaged."""
     found: list[Path] = []
     for root, dirs, names in os.walk(directory, onerror=_unlisted):
         dirs[:] = [name for name in dirs if _walked(root, name)]
-        found += [Path(root, name) for name in names
-                  if name.lower().endswith(".har") and not name.startswith("._")]
+        found += [Path(root, name) for name in names if _recorded(root, name)]
     if not found:
         raise HarError(f"No .har files under {directory}")
     return sorted(found, key=lambda path: path.relative_to(directory).as_posix())
@@ -101,6 +108,8 @@ def load_traffic(path: str | Path, domain: str | None = None,
 
 
 def _load_file(path: Path, domain: str | None, every_script: bool) -> CaptureResult:
+    if is_zip(path):
+        return load_hars([path], domain, every_script)
     data = read_json(path)
     if isinstance(data, dict) and "log" in data:
         return har_capture(data, path, domain, every_script)
