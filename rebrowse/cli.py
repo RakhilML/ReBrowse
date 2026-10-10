@@ -81,10 +81,11 @@ def build(url: str, steps: str | None):
 def import_har(file: Path, domain: str | None):
     """Build a skill from a HAR file exported by browser DevTools, a proxy or a test run.
 
-    FILE may also be a directory of HAR files, such as an e2e suite's test-results, read as
-    one recording. No request is replayed. Cookies, Authorization and other credential
-    headers are dropped, and secret-named query and body values are redacted before anything
-    is stored.
+    FILE may also be a Playwright HAR archive (.zip) or a directory of HAR files and
+    archives, such as an e2e suite's test-results, read as one recording. Bodies Playwright
+    attached as files next to a HAR are read with it. No request is replayed. Cookies,
+    Authorization and other credential headers are dropped, and secret-named query and body
+    values are redacted before anything is stored.
     """
     from rebrowse.orchestrator.pipeline import import_har as do_import
 
@@ -149,9 +150,9 @@ def _skill_document(target: str) -> tuple[dict, dict]:
 def openapi(target: str, domain: str | None, out: Path | None):
     """Export a skill or a recording as an OpenAPI 3.1 document (JSON).
 
-    TARGET is a HAR file or a directory of HAR files, a capture saved by build or a
-    baseline, documented from its traffic with no LLM or skill, so a HAR and the baseline
-    written from it give the same bytes. Any other TARGET is a skill id or domain. Nothing is
+    TARGET is a HAR file, a Playwright .zip HAR archive, a directory of them, a capture
+    saved by build or a baseline, documented from its traffic with no LLM or skill, so a HAR
+    and the baseline written from it give the same bytes. Any other TARGET is a skill id or domain. Nothing is
     sent over the network, and sensitive values in bodies, query strings and headers are
     redacted.
     """
@@ -162,7 +163,8 @@ def openapi(target: str, domain: str | None, out: Path | None):
     recording = path.is_file() or path.is_dir()
     if domain and not recording:
         raise click.UsageError("--domain needs a recording file or directory as TARGET")
-    if not recording and ("/" in target or "\\" in target or target.endswith((".har", ".json"))):
+    if not recording and ("/" in target or "\\" in target
+                          or target.lower().endswith((".har", ".json"))):
         _emit({"error": f"No such file: {target}"})
         return
     try:
@@ -240,10 +242,11 @@ def _traffic(command: str, source: str, domain: str | None,
 def mock(source: str, domain: str | None, port: int):
     """Answer a frontend's API calls from recorded traffic, on 127.0.0.1 only.
 
-    SOURCE is a HAR file or a directory of HAR files, a capture saved by build, or a
-    HOST[:PORT] whose newest saved capture is used. Requests are matched on templated paths
-    and GraphQL operations. Nothing is forwarded to the real site, secret-named values in
-    responses are redacted, and no recorded header but content-type is sent back.
+    SOURCE is a HAR file, a Playwright HAR archive (.zip) or a directory of them, a capture
+    saved by build, or a HOST[:PORT] whose newest saved capture is used. Requests are matched
+    on templated paths and GraphQL operations. Nothing is forwarded to the real site,
+    secret-named values in responses are redacted, and no recorded header but content-type
+    is sent back.
     """
     from rebrowse.mock import MockServer, build_routes, route_table
 
@@ -356,7 +359,8 @@ def diff(base: str, head: str, domains: tuple[str, ...], accepted: Path | None,
          update_accepted: bool):
     """Report the API changes from BASE to HEAD that can break their client.
 
-    Each is a HAR file or a directory of HAR files, a capture saved by build, or a
+    Each is a HAR file, a Playwright .zip HAR archive or a directory of them, a capture
+    saved by build, or a
     HOST[:PORT] whose newest saved capture is used. Nothing is sent over the network, and
     the report holds routes, statuses, media types, field paths and JSON types, never a
     response value (object keys that read like names do appear, as field names). Breaking
@@ -421,7 +425,8 @@ def contract(source: str, against: str, header_env: tuple[str, ...], domain: str
              follow_ids: bool, accepted: Path | None, update_accepted: bool):
     """Replay the reads recorded in SOURCE against ORIGIN and report what breaks the client.
 
-    SOURCE is a HAR file or a directory of HAR files, a capture saved by build, or a
+    SOURCE is a HAR file, a Playwright .zip HAR archive or a directory of them, a capture
+    saved by build, or a
     HOST[:PORT] whose newest saved capture is used. Only reads are sent, at most three per
     route, one at a time, without retries or following redirects; calls to sibling hosts are
     skipped. Secret-named values are redacted and recorded credentials and cookies are never
@@ -490,7 +495,8 @@ def contract(source: str, against: str, header_env: tuple[str, ...], domain: str
 def baseline(source: str, domain: str | None, out: Path | None):
     """Write the API traffic in SOURCE as a recording that is safe to commit.
 
-    SOURCE is a HAR file or a directory of HAR files, a capture saved by build, or a
+    SOURCE is a HAR file, a Playwright .zip HAR archive or a directory of them, a capture
+    saved by build, or a
     HOST[:PORT] whose newest saved capture is used. The output is a capture that diff,
     contract and mock read as SOURCE.
     Credentials are removed as contract removes them before sending, every response value
@@ -538,7 +544,8 @@ def coverage(source: str, domain: str | None, fail_under: float | None):
     """Report the API routes and GraphQL operations that SOURCE's own JS bundles reference and
     SOURCE never recorded with a 2xx or 304 answer, with the effect of each.
 
-    SOURCE is a HAR file or a directory of HAR files, whose first-party scripts are all read,
+    SOURCE is a HAR file, a .zip HAR archive or a directory of them, whose first-party
+    scripts are all read,
     a capture saved by build, which keeps a limited number of scripts, or a HOST[:PORT] whose
     newest saved capture is used; a baseline keeps no JS. Nothing is sent over the network,
     no LLM is called and no bundle source is printed. Exits 1 when coverage is below

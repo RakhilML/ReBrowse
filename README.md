@@ -191,6 +191,16 @@ and builds the same kind of skill, without launching a browser or replaying any 
   flow the tests exercise ends up in the skill. `browser.new_context(record_har_path="e2e.har")`
   gives a single file only when every test shares that one context, and @playwright/test
   gives each test its own.
+- **Playwright recordings.** `page.routeFromHAR('hars/app.har', { update: true })`, the HAR
+  mocking workflow, and `recordHar: { path: 'app.har', content: 'attach' }` write each body to
+  its own file next to the HAR (`<sha1>.json`), which the HAR names in `_file`.
+  `recordHar: { path: 'network.zip' }` writes a zip archive holding `har.har` and those files.
+  rebrowse reads those bodies, and a `.zip` archive is accepted wherever a HAR file is, so
+  `rebrowse import-har hars/` or `rebrowse openapi network.zip` work on the recordings the
+  tests already replay. Keep the body files with the HAR: a JSON, text or request body whose
+  file is missing is an input error naming the HAR and the file, never a recording without
+  its bodies, and a `_file` that is not a plain file in the HAR's own folder (a path, a
+  symlink) is refused. Only those files, or the archive's entries, are opened.
 - **A proxy.** mitmproxy, Charles and Proxyman all export HAR.
 
 The skill is learned for one site: `--domain host[:port]`, defaulting to the host of the
@@ -225,7 +235,8 @@ so recording per context leaves one HAR per test, and parallel workers write the
 HAR plugins write one per spec, and DevTools exports made by hand cover one area of an app at a
 time. Every command that reads a recording (`openapi`, `mock`, `baseline`, `diff`, `contract`,
 `coverage` and `import-har`) also takes a directory, and reads every file under it whose name
-ends in `.har`, in any case and at any depth, as one recording:
+ends in `.har`, and every Playwright HAR archive (a `.zip` holding `har.har`), in any case and
+at any depth, as one recording:
 
 ```bash
 rebrowse baseline test-results/ -o api-baseline.json
@@ -249,16 +260,21 @@ rebrowse diff main-hars/ pr-hars/
 - **Same bytes.** `baseline` sorts and deduplicates, so `baseline test-results/` writes the
   same file as a baseline of one HAR holding the same calls, and renaming or reordering the
   files changes nothing unless it changes which site is chosen. The same holds for `openapi`.
-- **Errors.** A directory with no `.har` file is an input error, and so is a `.har` that is not
-  valid JSON or HAR, such as one cut short by a crashed test, which the error names. Nothing is
+- **Errors.** A directory with no `.har` file is an input error, and so is a broken
+  recording, which the error names: a `.har` or archive that is not valid JSON or HAR, such
+  as one cut short by a crashed test, or whose body files are missing, and any `.zip` that is
+  empty or cut short, whatever its name, since it may have been a HAR archive. Nothing is
   written, so a broken file never silently shrinks a baseline. The exit code is the command's
   own for bad input.
 - **Output.** stderr gets one line, such as `[baseline] read 14 HAR files under test-results`,
   and the JSON on stdout keeps its shape, with `source` set to the directory. A directory wins
   over a saved capture of a host with the same name, as a file does.
 
-Captures and baselines (`.json`) in the directory are not read, nor are Playwright's `.zip`
-HAR archives. A fixture that records each test into its own folder under `test-results/`:
+Captures and baselines (`.json`) in the directory are not read, and neither are the body
+files Playwright attaches to a HAR, except through the HAR that names them. Playwright's
+`trace.zip` and any other zip without a `har.har` entry are skipped, as is a file named `.zip`
+that is not a zip, while an empty or cut-short zip is an error. A fixture that records each test into its own folder under `test-results/`
+(with `testInfo.outputPath('network.zip')`, each test writes an archive instead):
 
 ```ts
 // fixtures.ts; specs import { test, expect } from './fixtures'
@@ -297,8 +313,12 @@ newest saved capture is used (`--domain` picks the site in a HAR, as for `import
 
 ```bash
 rebrowse mock e2e.har                                     # http://127.0.0.1:8787
+rebrowse mock hars/                                       # the HARs Playwright tests replay
 rebrowse build http://localhost:8080 && rebrowse mock localhost:8080 -p 0
 ```
+
+`rebrowse mock hars/` serves the same HARs the Playwright tests replay with `routeFromHAR`,
+bodies included, to Storybook or the dev server.
 
 Point the app's API base URL, or its dev-server proxy, at the printed `url`. The route table
 is printed to stdout as JSON at startup, and each request is logged to stderr with how it was
