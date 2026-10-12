@@ -132,6 +132,7 @@ flowchart TB
 
 | Page | Read it to learn |
 |---|---|
+| [Interactive explainer](docs/explainer.html) | rebrowse in one page: read a sample recording, see each output, test which changes break. Open the file in a browser |
 | [Architecture](docs/architecture.md) | How the parts of rebrowse fit together |
 | [Recordings](docs/recordings.md) | Which inputs rebrowse reads and what it removes |
 | [Skills](docs/skills.md) | `build`, `import-har`, `run`, `verify`, keys and MCP |

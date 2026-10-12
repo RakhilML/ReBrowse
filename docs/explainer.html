@@ -1,0 +1,696 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>rebrowse explained</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100..125,500..900&family=JetBrains+Mono:wght@400;600&family=Public+Sans:ital,wght@0,400;0,600;1,400&display=swap">
+<style>
+  :root {
+    --ground: #F3F5F7;
+    --surface: #FFFFFF;
+    --sunken: #E9EDF1;
+    --ink: #121A22;
+    --muted: #55636F;
+    --line: #D5DCE2;
+    --accent: #0A7C76;
+    --accent-soft: #D5EEEC;
+    --redact: #B3243B;
+    --redact-soft: #F7DCE1;
+    --info: #3D5F8F;
+    --info-soft: #DCE6F3;
+    --amber: #9A6510;
+    --amber-soft: #F5E7CC;
+    --code-bg: #0F1A22;
+    --code-ink: #D9E4EC;
+    --code-dim: #7F93A3;
+    --code-key: #7FD4CD;
+    --code-str: #F2C27B;
+    --display: "Archivo", "Arial Narrow", system-ui, sans-serif;
+    --body: "Public Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
+    --radius: 6px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --ground: #0D1318;
+      --surface: #141C23;
+      --sunken: #1A242C;
+      --ink: #E2E9EE;
+      --muted: #93A3B0;
+      --line: #27333C;
+      --accent: #3CC1B7;
+      --accent-soft: #123A38;
+      --redact: #FF7088;
+      --redact-soft: #43202A;
+      --info: #8EB2E6;
+      --info-soft: #1D2C40;
+      --amber: #E9B35A;
+      --amber-soft: #3A2D16;
+      --code-bg: #080D11;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ground: #0D1318;
+    --surface: #141C23;
+    --sunken: #1A242C;
+    --ink: #E2E9EE;
+    --muted: #93A3B0;
+    --line: #27333C;
+    --accent: #3CC1B7;
+    --accent-soft: #123A38;
+    --redact: #FF7088;
+    --redact-soft: #43202A;
+    --info: #8EB2E6;
+    --info-soft: #1D2C40;
+    --amber: #E9B35A;
+    --amber-soft: #3A2D16;
+    --code-bg: #080D11;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font: 16px/1.6 var(--body);
+    padding-inline: 20px;
+    padding-block: 0 64px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1120px; margin-inline: auto; }
+  h1, h2, h3 { font-family: var(--display); line-height: 1.08; text-wrap: balance; margin: 0; }
+  h1 { font-size: clamp(2.2rem, 4.2vw, 3.3rem); font-weight: 850; font-stretch: 112%; letter-spacing: -0.02em; }
+  h2 { font-size: clamp(1.6rem, 3vw, 2.2rem); font-weight: 800; font-stretch: 115%; letter-spacing: -0.01em; }
+  h3 { font-size: 1.1rem; font-weight: 750; font-stretch: 108%; }
+  p { margin: 0; max-width: 65ch; }
+  code, kbd, .mono { font-family: var(--mono); font-size: 0.88em; }
+  :not(pre) > code { background: var(--sunken); padding: 0.1em 0.35em; border-radius: 4px; }
+  a { color: var(--accent); text-underline-offset: 3px; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .label {
+    font: 600 0.72rem/1 var(--mono); letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--muted);
+  }
+  section { padding-block: 72px 0; }
+  .section-head { display: grid; gap: 12px; margin-bottom: 28px; }
+  .section-head p { color: var(--muted); }
+
+  /* top bar */
+  .top {
+    display: flex; justify-content: space-between; align-items: center; gap: 16px;
+    padding-block: 20px; border-bottom: 1px solid var(--line);
+  }
+  .brand { font: 800 1.15rem/1 var(--display); font-stretch: 125%; letter-spacing: -0.01em; }
+  .brand span { color: var(--accent); }
+  .top nav { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 0.9rem; }
+  .top nav a { color: var(--muted); text-decoration: none; }
+  .top nav a:hover { color: var(--ink); }
+
+  /* hero */
+  .hero { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 40px; padding-block: 56px 0; align-items: start; }
+  .hero-copy { display: grid; gap: 20px; }
+  .hero-copy .lede { font-size: 1.15rem; color: var(--muted); }
+  .hero-copy .lede strong { color: var(--ink); }
+  .rules { display: grid; gap: 10px; margin-top: 8px; }
+  .rule { display: grid; grid-template-columns: auto 1fr; gap: 12px; align-items: start; }
+  .rule b { font: 700 0.78rem/1.6 var(--mono); color: var(--accent); }
+
+  /* network panel */
+  .panel {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+    overflow: hidden; box-shadow: 0 1px 0 var(--line), 0 18px 40px -28px rgba(10, 30, 45, 0.45);
+  }
+  .panel-bar {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--sunken);
+  }
+  .panel-bar .file { font: 600 0.82rem/1 var(--mono); }
+  .panel-bar .file small { color: var(--muted); font-weight: 400; }
+  .btn {
+    border: 1px solid var(--line); background: var(--surface); border-radius: 5px;
+    padding: 6px 12px; font-size: 0.85rem; font-weight: 600;
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--surface); }
+  .btn:disabled { opacity: 0.5; cursor: default; }
+  .btn-row { display: flex; gap: 8px; }
+  .net { overflow-x: auto; }
+  .net table { width: 100%; border-collapse: collapse; font: 0.8rem/1.4 var(--mono); min-width: 560px; }
+  .net th {
+    text-align: left; font-weight: 600; color: var(--muted); padding: 7px 12px;
+    border-bottom: 1px solid var(--line); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .net td { padding: 7px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; vertical-align: middle; }
+  .net tr { cursor: pointer; transition: opacity 240ms ease, background 240ms ease; }
+  .net tbody tr:hover { background: var(--sunken); }
+  .net tr.sel { background: var(--accent-soft); }
+  .net tr.gone td:not(.verdict-cell) { opacity: 0.38; text-decoration: line-through; text-decoration-color: var(--muted); }
+  .net .status { font-variant-numeric: tabular-nums; }
+  .s2 { color: var(--accent); } .s3 { color: var(--amber); } .s4 { color: var(--redact); }
+  .method { font-weight: 600; }
+  .path-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+  .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 99px; font: 600 0.7rem/1.5 var(--mono);
+    background: var(--sunken); color: var(--muted); white-space: nowrap;
+  }
+  .tag.read { background: var(--accent-soft); color: var(--accent); }
+  .tag.write { background: var(--amber-soft); color: var(--amber); }
+  .tag.drop { background: var(--sunken); color: var(--muted); }
+  .tag.scan { background: var(--info-soft); color: var(--info); }
+  .verdict-cell .tag { opacity: 0; transform: translateX(-6px); transition: opacity 260ms ease, transform 260ms ease; }
+  .verdict-cell .tag.shown, .read-done .verdict-cell .tag { opacity: 1; transform: none; }
+  .detail { border-top: 1px solid var(--line); padding: 14px; display: grid; gap: 10px; }
+  .detail h3 { font-size: 0.95rem; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; font: 0.8rem/1.5 var(--mono); }
+  .kv dt { color: var(--muted); }
+  .kv dd { margin: 0; overflow-wrap: anywhere; }
+  .redacted { color: var(--redact); background: var(--redact-soft); padding: 0 4px; border-radius: 3px; }
+  .struck { text-decoration: line-through; color: var(--muted); }
+  .summary { display: flex; flex-wrap: wrap; gap: 8px 18px; padding: 12px 14px; border-top: 1px solid var(--line); font-size: 0.85rem; color: var(--muted); }
+  .summary b { color: var(--ink); font-variant-numeric: tabular-nums; }
+
+  /* outputs */
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 18px; }
+  .tab {
+    border: 1px solid var(--line); background: var(--surface); border-radius: 99px;
+    padding: 7px 14px; font-size: 0.9rem; font-weight: 600;
+  }
+  .tab[aria-selected="true"] { background: var(--ink); border-color: var(--ink); color: var(--ground); }
+  .out { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 6fr); gap: 28px; align-items: start; }
+  .out-copy { display: grid; gap: 14px; }
+  .out-copy ul { margin: 0; padding-left: 1.1em; display: grid; gap: 6px; max-width: 60ch; }
+  .term { background: var(--code-bg); color: var(--code-ink); border-radius: var(--radius); overflow: hidden; }
+  .term-bar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border-bottom: 1px solid #22303A; }
+  .term-bar span { font: 0.72rem/1 var(--mono); color: var(--code-dim); letter-spacing: 0.08em; text-transform: uppercase; }
+  .copy { background: transparent; border: 1px solid #2C3B46; color: var(--code-dim); border-radius: 4px; padding: 3px 9px; font: 0.72rem/1.4 var(--mono); }
+  .copy:hover { color: var(--code-ink); }
+  .term pre { margin: 0; padding: 14px 16px; overflow-x: auto; font: 0.8rem/1.6 var(--mono); }
+  .term .cmd { color: var(--code-ink); }
+  .term .cmd::before { content: "$ "; color: var(--code-dim); }
+  .term .dim { color: var(--code-dim); }
+  .term .k { color: var(--code-key); }
+  .term .s { color: var(--code-str); }
+  .term .bad { color: #FF8A9B; }
+  .term .ok { color: #7FD4CD; }
+
+  /* breaking explorer */
+  .explorer { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 28px; align-items: start; }
+  .changes { display: grid; gap: 6px; }
+  .change {
+    text-align: left; border: 1px solid var(--line); background: var(--surface); border-radius: var(--radius);
+    padding: 10px 14px; font-size: 0.92rem; line-height: 1.45; display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center;
+  }
+  .change[aria-pressed="true"] { border-color: var(--ink); box-shadow: inset 3px 0 0 var(--ink); }
+  .change .hint { font: 0.7rem/1 var(--mono); color: var(--muted); }
+  .verdict {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px;
+    display: grid; gap: 14px; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 16px);
+  }
+  .pill { justify-self: start; font: 700 0.78rem/1 var(--mono); padding: 7px 12px; border-radius: 99px; letter-spacing: 0.04em; }
+  .pill.breaking { background: var(--redact-soft); color: var(--redact); }
+  .pill.info { background: var(--info-soft); color: var(--info); }
+  .verdict .kind { font: 600 1.4rem/1.1 var(--display); font-stretch: 112%; }
+  .verdict .exit { font: 0.8rem/1.5 var(--mono); color: var(--muted); }
+
+  /* follow ids */
+  .steps { display: grid; grid-template-columns: minmax(0, 4fr) minmax(0, 7fr); gap: 28px; align-items: start; }
+  .lanes { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .lane-head { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid var(--line); background: var(--sunken); }
+  .lane-head div { padding: 10px 14px; font: 600 0.75rem/1.3 var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+  .lane-head div + div { border-left: 1px solid var(--line); }
+  .msgs { display: grid; gap: 0; }
+  .msg { display: grid; grid-template-columns: 1fr 1fr; border-bottom: 1px solid var(--line); font: 0.8rem/1.5 var(--mono); transition: background 240ms ease, opacity 240ms ease; }
+  .msg > div { padding: 10px 14px; overflow-wrap: anywhere; }
+  .msg > div + div { border-left: 1px solid var(--line); }
+  .msg.future { opacity: 0.28; }
+  .msg.now { background: var(--accent-soft); }
+  .msg .arrow { color: var(--muted); }
+  .msg .hl { color: var(--accent); font-weight: 600; }
+  .msg .bad { color: var(--redact); font-weight: 600; }
+  .stepper { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .stepper .count { font: 0.8rem/1 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+  .step-text { min-height: 6.5em; }
+
+  /* CI lanes */
+  .ci { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+  .ci-lane { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; display: grid; gap: 12px; align-content: start; }
+  .ci-lane h3 { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .ci-lane h3 small { font: 0.72rem/1 var(--mono); color: var(--muted); font-weight: 400; }
+  .ci-step { display: grid; gap: 4px; padding-left: 14px; border-left: 2px solid var(--line); }
+  .ci-step code { justify-self: start; }
+  .ci-step p { font-size: 0.88rem; color: var(--muted); }
+  .ci-step.key { border-left-color: var(--accent); }
+  .artifact-note { margin-top: 14px; font-size: 0.9rem; color: var(--muted); }
+
+  /* commands */
+  .filter { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; }
+  .filter input {
+    flex: 1; max-width: 420px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 5px;
+    background: var(--surface); color: var(--ink); font: 0.9rem var(--body);
+  }
+  .cmds { overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+  .cmds table { width: 100%; border-collapse: collapse; min-width: 560px; }
+  .cmds th, .cmds td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .cmds th { font: 600 0.72rem/1 var(--mono); text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+  .cmds td:first-child { font: 0.82rem/1.5 var(--mono); white-space: nowrap; }
+  .cmds tr:last-child td { border-bottom: 0; }
+  .group-tag { font: 600 0.68rem/1 var(--mono); padding: 3px 7px; border-radius: 99px; }
+  .group-tag.skill { background: var(--amber-soft); color: var(--amber); }
+  .group-tag.rec { background: var(--accent-soft); color: var(--accent); }
+  .empty { padding: 14px; color: var(--muted); }
+
+  footer { margin-top: 72px; padding-top: 22px; border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 8px 22px; font-size: 0.88rem; color: var(--muted); }
+
+  @media (max-width: 860px) {
+    .hero, .out, .explorer, .steps { grid-template-columns: minmax(0, 1fr); }
+    .ci { grid-template-columns: minmax(0, 1fr); }
+    .verdict { position: static; }
+    .top nav { display: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; }
+  }
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="brand">re<span>browse</span></div>
+    <nav aria-label="Sections">
+      <a href="#reader">Reader</a>
+      <a href="#outputs">Outputs</a>
+      <a href="#breaking">Breaking?</a>
+      <a href="#follow">Follow ids</a>
+      <a href="#ci">CI</a>
+      <a href="#commands">Commands</a>
+    </nav>
+  </header>
+
+  <section class="hero" id="reader" aria-labelledby="hero-title">
+    <div class="hero-copy">
+      <span class="label">Learn an API from its traffic</span>
+      <h1 id="hero-title">Your frontend already documents its API.</h1>
+      <p class="lede">Every call it makes is in the browser's network panel. <strong>rebrowse reads that
+        traffic</strong> and finds the API behind it. Then it writes docs, runs a mock, keeps a safe
+        baseline and checks every pull request against it.</p>
+      <div class="rules">
+        <div class="rule"><b>RULE 1</b><p>No secret leaves. rebrowse removes cookies, tokens and passwords as it reads.</p></div>
+        <div class="rule"><b>RULE 2</b><p>Nothing changes data without you. rebrowse sends reads only, unless you confirm a write.</p></div>
+      </div>
+      <p>Press <strong>Read the recording</strong>. Then pick a row to see what the reader does to it.</p>
+    </div>
+
+    <div class="panel" id="net-panel">
+      <div class="panel-bar">
+        <span class="file">shop.har <small>· 10 requests · recorded from an e2e test</small></span>
+        <div class="btn-row">
+          <button class="btn primary" id="read-btn" type="button">Read the recording</button>
+          <button class="btn" id="reset-btn" type="button">Reset</button>
+        </div>
+      </div>
+      <div class="net">
+        <table aria-label="Recorded requests">
+          <thead><tr><th>Method</th><th>Path</th><th>Status</th><th>Type</th><th>rebrowse</th></tr></thead>
+          <tbody id="net-rows"></tbody>
+        </table>
+      </div>
+      <div class="detail" id="detail" aria-live="polite"></div>
+      <div class="summary" id="summary"></div>
+    </div>
+  </section>
+
+  <section id="outputs" aria-labelledby="outputs-title">
+    <div class="section-head">
+      <span class="label">One recording, many outputs</span>
+      <h2 id="outputs-title">What you get from shop.har</h2>
+      <p>Each output below comes from the same ten requests. Everything except skills works offline, with no LLM.</p>
+    </div>
+    <div class="tabs" role="tablist" id="tabs" aria-label="Outputs"></div>
+    <div class="out" id="out" role="tabpanel"></div>
+  </section>
+
+  <section id="breaking" aria-labelledby="breaking-title">
+    <div class="section-head">
+      <span class="label">diff and contract</span>
+      <h2 id="breaking-title">Is this change breaking?</h2>
+      <p>rebrowse judges a change from the frontend's side. Pick a change to see the verdict and the rule behind it.</p>
+    </div>
+    <div class="explorer">
+      <div class="changes" id="changes"></div>
+      <div class="verdict" id="verdict" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <section id="follow" aria-labelledby="follow-title">
+    <div class="section-head">
+      <span class="label">contract --follow-ids</span>
+      <h2 id="follow-title">Ids from the server's own answers</h2>
+      <p>The recording was made against staging. The CI backend has other data. Step through how rebrowse finds the right ids.</p>
+    </div>
+    <div class="steps">
+      <div class="out-copy">
+        <div class="step-text" id="step-text" aria-live="polite"></div>
+        <div class="stepper">
+          <button class="btn" id="prev" type="button">Back</button>
+          <button class="btn primary" id="next" type="button">Next step</button>
+          <span class="count" id="step-count"></span>
+        </div>
+      </div>
+      <div class="lanes">
+        <div class="lane-head"><div>rebrowse sends</div><div>CI backend answers</div></div>
+        <div class="msgs" id="msgs"></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="ci" aria-labelledby="ci-title">
+    <div class="section-head">
+      <span class="label">Put it in CI</span>
+      <h2 id="ci-title">Three jobs, one committed file</h2>
+      <p>The frontend owns the baseline. Both repos check their pull requests against it.</p>
+    </div>
+    <div class="ci">
+      <div class="ci-lane">
+        <h3>main <small>frontend repo</small></h3>
+        <div class="ci-step"><code>e2e tests</code><p>Write one HAR file for each test into <code>test-results/</code>.</p></div>
+        <div class="ci-step key"><code>rebrowse baseline test-results/</code><p>Write <code>api-baseline.json</code>. Commit it. Never commit the HAR files.</p></div>
+        <div class="ci-step"><code>rebrowse openapi api-baseline.json</code><p>Refresh <code>docs/openapi.json</code>. Same bytes when the API is the same.</p></div>
+      </div>
+      <div class="ci-lane">
+        <h3>Pull request <small>frontend repo</small></h3>
+        <div class="ci-step"><code>e2e tests</code><p>Record the new run.</p></div>
+        <div class="ci-step key"><code>rebrowse diff api-baseline.json test-results/</code><p>Fail on a change that breaks the frontend.</p></div>
+        <div class="ci-step"><code>rebrowse coverage test-results/ --fail-under 80</code><p>Fail when tests miss too many API calls the code can make.</p></div>
+      </div>
+      <div class="ci-lane">
+        <h3>Pull request <small>backend repo</small></h3>
+        <div class="ci-step"><code>docker compose up -d --wait api</code><p>Start the changed backend with its own fixtures.</p></div>
+        <div class="ci-step key"><code>rebrowse contract api-baseline.json --against http://api:8000 --follow-ids</code><p>Replay the frontend's reads. Fail when an answer breaks the frontend.</p></div>
+        <div class="ci-step"><code>--header-env Cookie=CI_SESSION</code><p>Sign in with a session from a CI secret. The value is never printed.</p></div>
+      </div>
+    </div>
+    <p class="artifact-note">Accept an intended break with <code>--accepted FILE</code>. A replay failure, an outage (5xx) and a new sign-in redirect can never be accepted by mistake.</p>
+  </section>
+
+  <section id="commands" aria-labelledby="commands-title">
+    <div class="section-head">
+      <span class="label">Reference</span>
+      <h2 id="commands-title">Every command</h2>
+    </div>
+    <div class="filter">
+      <label class="label" for="cmd-filter">Filter</label>
+      <input id="cmd-filter" type="search" placeholder="Try: mock, ci, secret, offline" autocomplete="off">
+    </div>
+    <div class="cmds">
+      <table>
+        <thead><tr><th>Command</th><th>Works on</th><th>Use it to</th></tr></thead>
+        <tbody id="cmd-rows"></tbody>
+      </table>
+      <div class="empty" id="cmd-empty" hidden>No command matches. Clear the filter to see all of them.</div>
+    </div>
+  </section>
+
+  <footer>
+    <span>rebrowse · private project, all rights reserved</span>
+    <a href="https://github.com/RakhilML/ReBrowse/blob/main/README.md">README</a>
+    <a href="https://github.com/RakhilML/ReBrowse/tree/main/docs">All docs</a>
+    <a href="https://github.com/RakhilML/ReBrowse/blob/main/docs/safety.md">Safety model</a>
+  </footer>
+</div>
+
+<script>
+(() => {
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  /* ---------- the reader ---------- */
+  const R = (v) => `<span class="redacted">${esc(v)}</span>`;
+  const rows = [
+    { m: "GET", p: "/", s: 200, t: "document", tag: ["drop", "page"],
+      why: "The page itself is not an API call. rebrowse uses its host to pick the site.",
+      raw: { "User-Agent": "Mozilla/5.0 …" }, clean: null },
+    { m: "GET", p: "/static/app.3f9a.js", s: 200, t: "script", tag: ["scan", "scanned"],
+      why: "A first-party script. rebrowse does not keep it as a route, but coverage scans it for API calls.",
+      raw: { "Content-Length": "412 kB" }, clean: null },
+    { m: "GET", p: "/api/me", s: 200, t: "json", tag: ["read", "read"],
+      why: "An API read. The session cookie and the bearer token are removed before anything is stored.",
+      raw: { "Cookie": "sid=9f2c41e07b", "Authorization": "Bearer eyJhbGciOiJIUzI1…", "Accept": "application/json" },
+      clean: { "Cookie": "removed", "Authorization": "removed", "Accept": "application/json" } },
+    { m: "POST", p: "https://stats.vendor.io/collect", s: 204, t: "fetch", tag: ["drop", "other site"],
+      why: "Another site. rebrowse drops calls to other sites and ad or analytics hosts.", raw: {}, clean: null },
+    { m: "GET", p: "/api/orders?userId=4410", s: 200, t: "json", tag: ["read", "read"],
+      why: "An API read. Its answer holds the order id 81723 that the next call sends.",
+      raw: { "Answer": '{"orders":[{"id":81723,"total":129.5}]}' }, clean: { "Answer": '{"orders":[{"id":81723,"total":0.5}]}  (in a baseline)' } },
+    { m: "GET", p: "/api/orders/81723", s: 200, t: "json", tag: ["read", "read"],
+      why: "An API read. The id becomes a template: GET /api/orders/{orders_id}.",
+      raw: { "Route": "/api/orders/81723" }, clean: { "Route": "/api/orders/{orders_id}" } },
+    { m: "POST", p: "/graphql  GetCart", s: 200, t: "json", tag: ["read", "read · GraphQL"],
+      why: "A GraphQL query sent by POST. It is a read. Each GraphQL operation is its own route.",
+      raw: { "operationName": "GetCart", "query": "query GetCart { cart { id lines } }" }, clean: null },
+    { m: "GET", p: "/images/hero.webp", s: 200, t: "image", tag: ["drop", "static"],
+      why: "A static file. Not part of the API.", raw: {}, clean: null },
+    { m: "POST", p: "/api/login", s: 200, t: "json", tag: ["write", "write"],
+      why: "A write. rebrowse never sends it without --yes. The password is redacted before it is stored.",
+      raw: { "Body": '{"email":"ann@shop.test","password":"hunter2"}' }, clean: { "Body": '{"email":"ann@shop.test","password":"<redacted>"}' } },
+    { m: "GET", p: "/api/track?event=view", s: 204, t: "fetch", tag: ["drop", "telemetry"],
+      why: "Telemetry. rebrowse drops it. The filter looks at whole path segments, so /api/login stays.",
+      raw: {}, clean: null },
+  ];
+  let read = false;
+  let selected = 2;
+  const tbody = $("net-rows");
+  tbody.innerHTML = rows.map((r, i) => `
+    <tr data-i="${i}" tabindex="0" aria-label="${esc(r.m + " " + r.p)}">
+      <td class="method">${esc(r.m)}</td>
+      <td class="path-cell" title="${esc(r.p)}">${esc(r.p)}</td>
+      <td class="status s${String(r.s)[0]}">${r.s}</td>
+      <td>${esc(r.t)}</td>
+      <td class="verdict-cell"><span class="tag ${r.tag[0]}">${esc(r.tag[1])}</span></td>
+    </tr>`).join("");
+  const trs = [...tbody.querySelectorAll("tr")];
+
+  function renderDetail() {
+    const r = rows[selected];
+    trs.forEach((tr, i) => tr.classList.toggle("sel", i === selected));
+    const pairs = Object.entries(r.raw);
+    const after = read && r.clean ? r.clean : null;
+    const lines = pairs.length ? pairs.map(([k, v]) => {
+      let val = esc(v);
+      if (after && k in after) {
+        val = after[k] === "removed"
+          ? `<span class="struck">${esc(v)}</span> ${R("removed")}`
+          : `<span class="struck">${esc(v)}</span><br>${esc(after[k]).replace("&lt;redacted&gt;", R("<redacted>"))}`;
+      }
+      return `<dt>${esc(k)}</dt><dd>${val}</dd>`;
+    }).join("") : `<dt>headers</dt><dd>nothing that rebrowse keeps</dd>`;
+    $("detail").innerHTML = `
+      <h3>${esc(r.m)} ${esc(r.p)}</h3>
+      <p>${read ? esc(r.why) : "Not read yet. Press <strong>Read the recording</strong>."}</p>
+      <dl class="kv">${lines}</dl>`;
+  }
+
+  function renderSummary() {
+    if (!read) {
+      $("summary").innerHTML = `<span>Raw HAR: <b>10</b> requests, <b>2</b> credentials, <b>1</b> password</span>`;
+      return;
+    }
+    $("summary").innerHTML = `
+      <span><b>5</b> API calls kept</span>
+      <span><b>4</b> reads · <b>1</b> write</span>
+      <span><b>4</b> requests dropped</span>
+      <span><b>3</b> secrets removed</span>`;
+  }
+
+  function setRead(on) {
+    read = on;
+    $("net-panel").classList.toggle("read-done", on);
+    trs.forEach((tr, i) => tr.classList.toggle("gone", on && rows[i].tag[0] === "drop"));
+    $("read-btn").disabled = on;
+    renderDetail();
+    renderSummary();
+  }
+
+  $("read-btn").addEventListener("click", () => {
+    $("read-btn").disabled = true;
+    if (reduce) { setRead(true); return; }
+    trs.forEach((tr, i) => setTimeout(() => {
+      tr.querySelector(".tag").classList.add("shown");
+      tr.classList.toggle("gone", rows[i].tag[0] === "drop");
+      if (i === trs.length - 1) setRead(true);
+    }, i * 110));
+  });
+  $("reset-btn").addEventListener("click", () => {
+    trs.forEach((tr) => tr.querySelector(".tag").classList.remove("shown"));
+    setRead(false);
+  });
+  trs.forEach((tr, i) => {
+    const pick = () => { selected = i; renderDetail(); };
+    tr.addEventListener("click", pick);
+    tr.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pick(); } });
+  });
+  setRead(false);
+
+  /* ---------- outputs ---------- */
+  const outputs = [
+    { id: "skill", name: "Skill", title: "Call the API in plain English",
+      points: ["<code>import-har</code> saves the five API calls as a skill.", "<code>run</code> lets an LLM pick one endpoint. It sees names, never values.", "A write needs <code>--yes</code>. Agents get the same skill over MCP."],
+      term: [["cmd", "rebrowse import-har shop.har"], ["dim", "[import-har] 5 endpoints: 5 added, 0 kept, 0 dropped"], ["cmd", 'rebrowse run "show my orders" --dry-run'],
+        ["", '{ <k>"call"</k>: <s>"GET https://shop.test/api/orders?userId={userId}"</s>, <k>"effect"</k>: <s>"read"</s> }']] },
+    { id: "openapi", name: "OpenAPI", title: "Docs that only change when the API does",
+      points: ["Built offline from the recording. No LLM.", "One response per recorded status.", "<code>info.version</code> is a hash, so a committed file diffs as an API changelog."],
+      term: [["cmd", "rebrowse openapi shop.har -o api.json"], ["", '<k>"/api/orders/{orders_id}"</k>: { <k>"get"</k>: {'], ["", '  <k>"x-rebrowse-effect"</k>: <s>"read"</s>,'],
+        ["", '  <k>"responses"</k>: { <k>"200"</k>: { … <k>"required"</k>: [<s>"id"</s>, <s>"total"</s>] } } } }']] },
+    { id: "mock", name: "Mock", title: "A backend for the UI, on your machine",
+      points: ["Serves recorded answers on 127.0.0.1.", "An unseen id gets the closest recording.", "No HTTP client inside. It never calls the real site."],
+      term: [["cmd", "rebrowse mock shop.har"], ["dim", "url: http://127.0.0.1:8787"], ["cmd", "curl -i http://127.0.0.1:8787/api/orders/999"],
+        ["", "x-rebrowse-mock: <k>nearest</k>"], ["", "x-rebrowse-route: GET /api/orders/{orders_id}"]] },
+    { id: "baseline", name: "Baseline", title: "A recording you can commit",
+      points: ["Credentials and response values are gone.", "Each value becomes a placeholder of its type.", "An id that a later read sends stays, for <code>--follow-ids</code>."],
+      term: [["cmd", "rebrowse baseline shop.har -o api-baseline.json"], ["", '<k>"url"</k>: <s>"https://shop.test/api/orders?userId=4410"</s>,'],
+        ["", '<k>"response_body"</k>: <s>"{\\"orders\\":[{\\"id\\":81723,\\"total\\":0.5}]}"</s>'], ["dim", "# 129.5 became 0.5 (a number). 81723 stays: /api/orders/81723 sends it."]] },
+    { id: "diff", name: "Diff", title: "Catch a break before it ships",
+      points: ["Compares two recordings from the frontend's side.", "No spec, no LLM, no network.", "Exit 1 on a breaking change, for CI."],
+      term: [["cmd", "rebrowse diff api-baseline.json test-results/"], ["", '{ <k>"severity"</k>: <span class="bad">"breaking"</span>, <k>"kind"</k>: <s>"field_removed"</s>,'],
+        ["", '  <k>"route"</k>: <s>"GET /api/orders/{orders_id}"</s>, <k>"field"</k>: <s>"$.total"</s> }'], ["dim", "exit 1"]] },
+    { id: "contract", name: "Contract", title: "Test the backend with the frontend's calls",
+      points: ["Replays recorded reads against a server you name.", "Never sends a write. Never follows a redirect.", "<code>--follow-ids</code> takes ids from that server's own answers."],
+      term: [["cmd", "rebrowse contract api-baseline.json --against http://api:8000 --follow-ids"], ["", '<k>"replayed"</k>: 4, <k>"answered"</k>: 4, <k>"breaking"</k>: 0,'],
+        ["", '<k>"followed"</k>: [{ <k>"route"</k>: <s>"GET /api/orders/{orders_id}"</s>, <k>"from"</k>: <s>"GET /api/orders"</s> }]'], ["ok", "exit 0  compatible"]] },
+    { id: "coverage", name: "Coverage", title: "Find what your tests never called",
+      points: ["Scans the frontend's own scripts for API calls.", "Lists each call that no recording made, with its effect.", "<code>--fail-under</code> turns it into a CI gate."],
+      term: [["cmd", "rebrowse coverage shop.har"], ["", '<k>"coverage"</k>: 71.4,'],
+        ["", '<k>"unrecorded"</k>: [{ <k>"method"</k>: <s>"DELETE"</s>, <k>"path"</k>: <s>"/api/orders/{id}"</s>, <k>"effect"</k>: <span class="bad">"destructive"</span> }]']] },
+  ];
+  const fmt = (line) => line.replace(/<k>/g, '<span class="k">').replace(/<\/k>/g, "</span>").replace(/<s>/g, '<span class="s">').replace(/<\/s>/g, "</span>");
+  const tabs = $("tabs");
+  tabs.innerHTML = outputs.map((o, i) => `<button class="tab" role="tab" id="tab-${o.id}" type="button" aria-selected="${i === 0}">${esc(o.name)}</button>`).join("");
+  function showOutput(i) {
+    const o = outputs[i];
+    [...tabs.children].forEach((t, j) => t.setAttribute("aria-selected", String(j === i)));
+    $("out").setAttribute("aria-labelledby", `tab-${o.id}`);
+    const commands = o.term.filter(([kind]) => kind === "cmd").map(([, text]) => text).join("\n");
+    $("out").innerHTML = `
+      <div class="out-copy"><h3>${esc(o.title)}</h3><ul>${o.points.map((p) => `<li>${p}</li>`).join("")}</ul></div>
+      <div class="term">
+        <div class="term-bar"><span>${esc(o.name)} · example output</span><button class="copy" type="button">Copy commands</button></div>
+        <pre>${o.term.map(([kind, text]) => `<div class="${kind}">${kind === "cmd" ? esc(text) : fmt(text)}</div>`).join("")}</pre>
+      </div>`;
+    const btn = $("out").querySelector(".copy");
+    btn.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(commands); btn.textContent = "Copied"; }
+      catch {
+        const range = document.createRange(); range.selectNodeContents($("out").querySelector("pre"));
+        const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range); btn.textContent = "Selected";
+      }
+      setTimeout(() => { btn.textContent = "Copy commands"; }, 1600);
+    });
+  }
+  [...tabs.children].forEach((t, i) => t.addEventListener("click", () => showOutput(i)));
+  tabs.addEventListener("keydown", (e) => {
+    const all = [...tabs.children]; const i = all.indexOf(document.activeElement);
+    if (i < 0) return;
+    const next = e.key === "ArrowRight" ? (i + 1) % all.length : e.key === "ArrowLeft" ? (i - 1 + all.length) % all.length : -1;
+    if (next >= 0) { e.preventDefault(); all[next].focus(); showOutput(next); }
+  });
+  showOutput(0);
+
+  /* ---------- breaking explorer ---------- */
+  const cases = [
+    { text: "<code>$.total</code> was in every answer. Now it is gone.", hint: "field", v: "breaking", kind: "field_removed",
+      why: "The frontend reads <code>total</code> on every order. Without it, the screen shows nothing or crashes." },
+    { text: "<code>$.coupon</code> was in some answers only. Now it is gone.", hint: "field", v: "info", kind: "field_removed",
+      why: "The frontend already handles a missing <code>coupon</code>. The recording may simply not have sampled it." },
+    { text: "A new field <code>$.currency</code> appears.", hint: "field", v: "info", kind: "field_added",
+      why: "Extra fields never break a client that does not read them." },
+    { text: "<code>$.email</code> was a string. Now it is sometimes <code>null</code>.", hint: "type", v: "breaking", kind: "field_type",
+      why: "Code that calls <code>email.toLowerCase()</code> now throws. A new <code>null</code> counts as a new type." },
+    { text: "<code>$.total</code> was an integer. Now it is <code>19.99</code>.", hint: "type", v: "info", kind: "field_type",
+      why: "JavaScript has one number type. An integer that becomes a decimal does not break the client." },
+    { text: "<code>GET /api/me</code> answered 200. Now it redirects to <code>/login</code>.", hint: "status", v: "breaking", kind: "status",
+      why: "The frontend expected data and gets a sign-in page. A 2xx that stops answering is breaking." },
+    { text: "A route answered 200. Now some calls answer 503.", hint: "status", v: "breaking", kind: "status",
+      why: "A new 5xx is an outage. It can never be accepted in an accepted-changes file." },
+    { text: "The answer was JSON. Now it is an empty 204.", hint: "body", v: "breaking", kind: "body_empty",
+      why: "<code>res.json()</code> fails on an empty body." },
+    { text: "The answer was JSON. Now it is an HTML page.", hint: "media", v: "breaking", kind: "content_type",
+      why: "A 2xx with a media type the recording never had. Often an error page or a sign-in page." },
+  ];
+  const changes = $("changes");
+  changes.innerHTML = cases.map((c, i) => `<button class="change" type="button" aria-pressed="${i === 0}" data-i="${i}"><span>${c.text}</span><span class="hint">${c.hint}</span></button>`).join("");
+  function showCase(i) {
+    const c = cases[i];
+    [...changes.children].forEach((b, j) => b.setAttribute("aria-pressed", String(j === i)));
+    $("verdict").innerHTML = `
+      <span class="pill ${c.v}">${c.v.toUpperCase()}</span>
+      <div class="kind mono">${esc(c.kind)}</div>
+      <p>${c.why}</p>
+      <div class="exit">${c.v === "breaking" ? "diff exits 1 · contract exits 1" : "reported as info · exit 0"}</div>`;
+  }
+  [...changes.children].forEach((b, i) => b.addEventListener("click", () => showCase(i)));
+  showCase(0);
+
+  /* ---------- follow ids ---------- */
+  const msgs = [
+    ["GET /api/orders/81723", '<span class="bad">404 Not Found</span>'],
+    ["GET /api/me", '200  {"id": <span class="hl">7</span>}'],
+    ['GET /api/orders?userId=<span class="hl">7</span>', '200  {"orders":[{"id": <span class="hl">32</span>}]}'],
+    ['GET /api/orders/<span class="hl">32</span>', '200  {"id":32,"total":18.4}'],
+  ];
+  const steps = [
+    { show: [], now: -1, text: "<h3>The recording asks for staging data</h3><p>On staging, the frontend called <code>GET /api/orders?userId=4410</code>. The answer held order <code>81723</code>. Then it called <code>GET /api/orders/81723</code>.</p>" },
+    { show: [0], now: 0, text: "<h3>Without --follow-ids</h3><p>rebrowse sends the recorded id. The CI backend has no order 81723. It answers 404. That is a false alarm: the API is fine, the data is different.</p>" },
+    { show: [], now: -1, text: "<h3>rebrowse traces each id</h3><p>In the recording, <code>81723</code> came from <code>$.orders[0].id</code> of <code>GET /api/orders</code>. The user id <code>4410</code> came from <code>$.id</code> of <code>GET /api/me</code>. No value leaves rebrowse.</p>" },
+    { show: [1], now: 1, text: "<h3>Ask the backend first</h3><p>rebrowse sends <code>GET /api/me</code>. The CI backend's user is <code>7</code>.</p>" },
+    { show: [1, 2], now: 2, text: "<h3>Use the backend's own id</h3><p>rebrowse sends the order list for user <code>7</code>. The first order is <code>32</code>.</p>" },
+    { show: [1, 2, 3], now: 3, text: "<h3>Compare, then judge</h3><p>rebrowse sends <code>GET /api/orders/32</code>. The answer has the same shape as the recording. Verdict: <strong>compatible</strong>. An id that two reads hold equally is never followed, so a wrong id is never sent.</p>" },
+  ];
+  let step = 0;
+  function showStep() {
+    const s = steps[step];
+    $("step-text").innerHTML = s.text;
+    $("msgs").innerHTML = msgs.map(([a, b], i) => {
+      const cls = s.show.includes(i) ? (i === s.now ? "msg now" : "msg") : "msg future";
+      return `<div class="${cls}"><div><span class="arrow">→</span> ${a}</div><div>${b}</div></div>`;
+    }).join("");
+    $("step-count").textContent = `Step ${step + 1} of ${steps.length}`;
+    $("prev").disabled = step === 0;
+    $("next").disabled = step === steps.length - 1;
+  }
+  $("prev").addEventListener("click", () => { step = Math.max(0, step - 1); showStep(); });
+  $("next").addEventListener("click", () => { step = Math.min(steps.length - 1, step + 1); showStep(); });
+  showStep();
+
+  /* ---------- commands ---------- */
+  const cmds = [
+    ["build <url>", "skill", "Open a site in a browser and save its API as a skill.", "browser chromium llm"],
+    ["import-har <file|folder>", "skill", "Save a skill from HAR files, without a browser.", "har playwright llm sign-in"],
+    ["run \"<request>\"", "skill", "Call the saved endpoint that matches a plain-English request.", "llm --yes write"],
+    ["verify <skill>", "skill", "Check which read endpoints still work.", "health read"],
+    ["skills · show · delete", "skill", "List, search, print and delete skills.", "manage"],
+    ["auth set · list · remove", "skill", "Keep API keys. Each key goes only to its own site.", "secret key vault"],
+    ["mcp", "skill", "Give skills to AI agents over MCP.", "agents tools act read"],
+    ["openapi <recording|skill>", "rec", "Write an OpenAPI 3.1 document, byte-stable.", "docs offline ci"],
+    ["mock <recording>", "rec", "Serve the recorded API on 127.0.0.1.", "storybook ui offline local"],
+    ["baseline <recording>", "rec", "Write a copy of a recording that is safe to commit.", "secret commit ci offline"],
+    ["diff <base> <head>", "rec", "Find API changes that break the frontend.", "ci breaking accepted offline"],
+    ["contract <recording> --against <server>", "rec", "Send recorded reads to a server and judge the answers.", "ci backend follow-ids header-env secret accepted"],
+    ["coverage <recording>", "rec", "Find API calls in the frontend code that no recording made.", "ci fail-under js offline"],
+  ];
+  $("cmd-rows").innerHTML = cmds.map(([c, g, d, k]) => `
+    <tr data-k="${esc((c + " " + d + " " + k + " " + (g === "rec" ? "recording" : "skill")).toLowerCase())}">
+      <td>rebrowse ${esc(c)}</td>
+      <td><span class="group-tag ${g}">${g === "rec" ? "recording" : "skill"}</span></td>
+      <td>${esc(d)}</td>
+    </tr>`).join("");
+  const cmdRows = [...$("cmd-rows").children];
+  $("cmd-filter").addEventListener("input", (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    let shown = 0;
+    cmdRows.forEach((tr) => { const ok = !q || tr.dataset.k.includes(q); tr.hidden = !ok; shown += ok; });
+    $("cmd-empty").hidden = shown > 0;
+  });
+})();
+</script>
